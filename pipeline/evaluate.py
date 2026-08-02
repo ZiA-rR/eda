@@ -1,0 +1,239 @@
+"""
+evaluate.py
+-----------
+Running models against the finished dataset.
+
+Two things matter here beyond a headline score.
+
+First, multi-answer questions need partial credit. Exact match alone hides
+most of what is going on, because a model that gets two of three correct
+options is doing better than one that gets none, and AER's own scoring uses
+both.
+
+Second, the interesting result is not the score, it is WHERE models fail.
+The winning AER team found three patterns shared across 14 models from 7
+families: causal chain incompleteness, proximate cause preference and
+salience bias, with under-selections outnumbering over-selections 1,389 to
+52. This module measures those directly, which is the part of the analysis
+worth publishing.
+"""
+
+import json
+import re
+import statistics
+from collections import Counter, defaultdict
+from typing import List, Dict, Optional
+
+from llm import call_model
+
+
+ANSWER_PROMPT = """You are analysing what caused a financial market event.
+
+EVIDENCE (news reporting from around the time):
+{context}
+
+EVENT TO EXPLAIN:
+{target}
+
+Which of the following were causes of this event? More than one may be
+correct. Select every option that genuinely contributed.
+
+A. {a}
+B. {b}
+C. {c}
+D. {d}
+
+Return ONLY JSON, no other text:
+{{"reasoning": "brief", "answer": ["A"]}}
+"""
+
+
+def _parse_answer(raw: str) -> List[str]:
+    raw = (raw or "").strip()
+    raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
+
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict) and "answer" in obj:
+            return sorted({str(x).strip().upper()[:1] for x in obj["answer"]
+                           if str(x).strip()[:1].upper() in "ABCD"})
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    m = re.search(r'"answer"\s*:\s*\[(.*?)\]', raw, flags=re.DOTALL)
+    if m:
+        return sorted({x.strip().strip('"\'').upper()[:1]
+                       for x in m.group(1).split(",")
+                       if x.strip().strip('"\'')[:1].upper() in "ABCD"})
+
+    found = re.findall(r"\b([ABCD])\b", raw.upper())
+    return sorted(set(found)) if found else []
+
+
+# ------------------------------------------------------------- metrics
+def score_prediction(pred: List[str], gold: List[str]) -> Dict:
+    p, g = set(pred), set(gold)
+    tp = len(p & g)
+
+    precision = tp / len(p) if p else 0.0
+    recall = tp / len(g) if g else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+
+    return {
+        "exact_match": int(p == g),
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "n_pred": len(p),
+        "n_gold": len(g),
+        "under_selected": max(0, len(g) - tp),   # correct ones it missed
+        "over_selected": max(0, len(p) - tp),    # wrong ones it picked
+    }
+
+
+def evaluate_model(questions: List[Dict],
+                   docs_by_topic: Dict,
+                   model: str = "claude",
+                   max_context: int = 20000,
+                   verbose: bool = True) -> Dict:
+    """
+    Run one model over the dataset.
+
+    The full document set goes into the context, distractor documents
+    included, because sorting the relevant evidence from the noise is part
+    of the task.
+    """
+    results = []
+
+    for i, q in enumerate(questions, 1):
+        topic = docs_by_topic.get(q["topic_id"], {})
+        parts = []
+        for d in topic.get("docs", []):
+            c = (d.get("content") or "")[:1500]
+            if c:
+                parts.append(f"[{d.get('source','')} {d.get('date','')}]\n{c}")
+        context = "\n\n".join(parts)[:max_context]
+
+        prompt = ANSWER_PROMPT.format(
+            context=context, target=q["target_event"],
+            a=q["option_A"], b=q["option_B"], c=q["option_C"], d=q["option_D"])
+
+        try:
+            raw = call_model(prompt, model=model, max_tokens=500)
+            pred = _parse_answer(raw)
+        except Exception as e:
+            pred = []
+            raw = f"ERROR {type(e).__name__}"
+
+        gold = [x for x in q["golden_answer"].split(",") if x]
+        m = score_prediction(pred, gold)
+
+        results.append({
+            "id": q.get("id", f"{q.get('asset')}_{q.get('event_date')}"),
+            "asset": q.get("asset"),
+            "pred": pred, "gold": gold, **m,
+            "n_gold": len(gold),
+            "raw": raw[:300],
+        })
+
+        if verbose and i % 20 == 0:
+            print(f"  {i}/{len(questions)}")
+
+    return {"model": model, "results": results, **aggregate(results)}
+
+
+def aggregate(results: List[Dict]) -> Dict:
+    if not results:
+        return {}
+    return {
+        "n": len(results),
+        "exact_match": round(statistics.mean(r["exact_match"] for r in results), 4),
+        "f1": round(statistics.mean(r["f1"] for r in results), 4),
+        "precision": round(statistics.mean(r["precision"] for r in results), 4),
+        "recall": round(statistics.mean(r["recall"] for r in results), 4),
+        "total_under_selected": sum(r["under_selected"] for r in results),
+        "total_over_selected": sum(r["over_selected"] for r in results),
+        "mean_n_pred": round(statistics.mean(r["n_pred"] for r in results), 2),
+        "mean_n_gold": round(statistics.mean(r["n_gold"] for r in results), 2),
+    }
+
+
+# ------------------------------------------------------- failure analysis
+def failure_analysis(eval_result: Dict, questions: List[Dict]) -> Dict:
+    """
+    Break the results down the way the AER winning team did.
+
+    The headline finding to test against: do models under-select far more
+    than they over-select, and does accuracy collapse as the number of
+    correct answers rises? If financial reasoning shows the same pattern as
+    general news, that is a result worth reporting on its own.
+    """
+    by_id = {q.get("id", f"{q.get('asset')}_{q.get('event_date')}"): q
+             for q in questions}
+    res = eval_result["results"]
+
+    # by how many answers were correct
+    by_card = defaultdict(list)
+    for r in res:
+        by_card[r["n_gold"]].append(r)
+
+    cardinality = {}
+    for k in sorted(by_card):
+        rs = by_card[k]
+        cardinality[k] = {
+            "n": len(rs),
+            "exact_match": round(statistics.mean(x["exact_match"] for x in rs), 3),
+            "f1": round(statistics.mean(x["f1"] for x in rs), 3),
+            "mean_predicted": round(statistics.mean(x["n_pred"] for x in rs), 2),
+        }
+
+    # by asset
+    by_asset = defaultdict(list)
+    for r in res:
+        by_asset[r["asset"]].append(r)
+    assets = {a: {"n": len(rs),
+                  "exact_match": round(statistics.mean(x["exact_match"] for x in rs), 3),
+                  "f1": round(statistics.mean(x["f1"] for x in rs), 3)}
+              for a, rs in by_asset.items()}
+
+    # which distractor types fooled it most
+    fooled = Counter()
+    missed_types = Counter()
+    for r in res:
+        q = by_id.get(r["id"])
+        if not q or "option_types" not in q:
+            continue
+        gold = set(r["gold"])
+        for L in set(r["pred"]) - gold:
+            fooled[q["option_types"].get(L, "unknown")] += 1
+        for L in gold - set(r["pred"]):
+            missed_types[q["option_types"].get(L, "unknown")] += 1
+
+    under = eval_result.get("total_under_selected", 0)
+    over = eval_result.get("total_over_selected", 0)
+
+    return {
+        "under_vs_over": {
+            "under_selected": under,
+            "over_selected": over,
+            "ratio": round(under / over, 1) if over else None,
+            "aer_reference": "1389 vs 52 in the AER winning system's analysis",
+        },
+        "by_cardinality": cardinality,
+        "by_asset": assets,
+        "distractors_that_fooled_it": dict(fooled.most_common()),
+        "correct_options_missed_by_type": dict(missed_types.most_common()),
+    }
+
+
+def compare_models(evals: List[Dict]) -> str:
+    """Small text table comparing several models."""
+    lines = [f"{'model':12s} {'n':>5s} {'exact':>8s} {'F1':>8s} "
+             f"{'prec':>8s} {'recall':>8s} {'pred/gold':>12s}",
+             "-" * 66]
+    for e in evals:
+        lines.append(
+            f"{e['model']:12s} {e['n']:5d} {e['exact_match']:8.3f} {e['f1']:8.3f} "
+            f"{e['precision']:8.3f} {e['recall']:8.3f} "
+            f"{e['mean_n_pred']:5.2f}/{e['mean_n_gold']:<6.2f}")
+    return "\n".join(lines)
