@@ -62,13 +62,35 @@ def fetch_prices(ticker: str, start: str, end: str) -> pd.Series:
 # ---------------------------------------------------------------- news
 GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 
+# GDELT allows roughly one request every 5 seconds. Going faster returns
+# 429 Too Many Requests. build_topic makes four searches per topic (one for
+# the story, three for distractors), so without a gap between them the
+# second and third reliably fail.
+#
+# This is enforced inside search_news rather than passed in as an option,
+# because every caller needs it and forgetting is the whole problem.
+GDELT_MIN_INTERVAL = 6.0
+_last_gdelt_call = 0.0
+
+
+def _gdelt_wait():
+    """Sleep just long enough since the previous GDELT call."""
+    global _last_gdelt_call
+    elapsed = time.time() - _last_gdelt_call
+    if elapsed < GDELT_MIN_INTERVAL:
+        time.sleep(GDELT_MIN_INTERVAL - elapsed)
+    _last_gdelt_call = time.time()
+
 
 def search_news(query: str,
                 date: str,
                 days_before: int = 2,
                 days_after: int = 1,
                 max_records: int = 40,
-                timeout: int = 30) -> List[Dict]:
+                timeout: int = 30,
+                english_only: bool = True,
+                retries: int = 4,
+                verbose: bool = True) -> List[Dict]:
     """
     Find articles around a date using GDELT.
 
@@ -78,13 +100,20 @@ def search_news(query: str,
     days_after  : a small window after, to catch same-story reporting that
                   landed late. Keep this SMALL, otherwise you pull in
                   consequences of the move and mislabel them as causes.
+    english_only: GDELT indexes many languages. Without this you get
+                  Romanian and Spanish articles mixed in, which the
+                  extraction stage cannot use.
+
+    Waits between calls and retries on 429 with escalating backoff.
     """
     d = dt.datetime.strptime(date, "%Y-%m-%d")
     start = (d - dt.timedelta(days=days_before)).strftime("%Y%m%d%H%M%S")
     end = (d + dt.timedelta(days=days_after)).strftime("%Y%m%d%H%M%S")
 
+    q = f"{query} sourcelang:english" if english_only else query
+
     params = {
-        "query": query,
+        "query": q,
         "mode": "artlist",
         "maxrecords": max_records,
         "startdatetime": start,
@@ -93,23 +122,46 @@ def search_news(query: str,
         "sort": "hybridrel",
     }
 
-    try:
-        resp = requests.get(GDELT_URL, params=params, timeout=timeout,
-                            headers={"User-Agent": "research-dataset-builder"})
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        print(f"  GDELT request failed for '{query}' on {date}: {e}")
-        return []
+    for attempt in range(retries):
+        _gdelt_wait()
+        try:
+            resp = requests.get(GDELT_URL, params=params, timeout=timeout,
+                                headers={"User-Agent": "research-dataset-builder"})
 
-    articles = data.get("articles", [])
-    return [{
-        "title": a.get("title", ""),
-        "url": a.get("url", ""),
-        "source": a.get("domain", ""),
-        "date": a.get("seendate", ""),
-        "language": a.get("language", ""),
-    } for a in articles]
+            if resp.status_code == 429:
+                wait = GDELT_MIN_INTERVAL * (2 ** attempt)
+                if verbose:
+                    print(f"  rate limited, waiting {wait:.0f}s "
+                          f"(attempt {attempt+1}/{retries})")
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            data = resp.json()
+
+        except Exception as e:
+            if attempt == retries - 1:
+                print(f"  GDELT failed for '{query}' on {date}: {e}")
+                return []
+            time.sleep(GDELT_MIN_INTERVAL * (2 ** attempt))
+            continue
+
+        articles = data.get("articles", [])
+        out = [{
+            "title": a.get("title", ""),
+            "url": a.get("url", ""),
+            "source": a.get("domain", ""),
+            "date": a.get("seendate", ""),
+            "language": a.get("language", ""),
+        } for a in articles]
+
+        if english_only:
+            out = [a for a in out
+                   if not a["language"] or a["language"].lower().startswith("eng")]
+        return out
+
+    print(f"  GDELT gave up on '{query}' after {retries} attempts")
+    return []
 
 
 def extract_text(url: str, timeout: int = 20) -> Optional[str]:
@@ -158,17 +210,30 @@ def build_topic(asset: str,
                 n_relevant: int = 15,
                 n_distractor: int = 5,
                 fetch_text: bool = True,
-                polite_delay: float = 1.0) -> Dict:
+                polite_delay: float = 1.0,
+                min_docs: int = 5,
+                verbose: bool = True) -> Dict:
     """
     Assemble the document set for one big move day.
 
     Targets roughly 20 documents per topic, matching AER's 19.7 average,
     with a deliberate share of distractor documents mixed in.
+
+    polite_delay applies between ARTICLE downloads. The gap between GDELT
+    searches is handled inside search_news, since that is where the rate
+    limit actually bites.
+
+    min_docs : warn loudly if the topic comes back this thin. A topic with
+               three documents cannot produce a good question, and it is
+               better to know now than to find out at the assembly stage.
     """
     docs = []
+    search_failures = 0
 
     # on-story documents
     hits = search_news(BASE_QUERIES[asset], date, max_records=n_relevant * 2)
+    if not hits:
+        search_failures += 1
     for h in hits[:n_relevant]:
         entry = {**h, "role": "relevant"}
         if fetch_text:
@@ -180,6 +245,8 @@ def build_topic(asset: str,
     per_query = max(1, n_distractor // len(DISTRACTOR_QUERIES[asset]))
     for q in DISTRACTOR_QUERIES[asset]:
         hits = search_news(q, date, max_records=per_query * 2)
+        if not hits:
+            search_failures += 1
         for h in hits[:per_query]:
             entry = {**h, "role": "distractor"}
             if fetch_text:
@@ -188,6 +255,17 @@ def build_topic(asset: str,
             docs.append(entry)
 
     kept = [d for d in docs if not fetch_text or d.get("content")]
+    n_rel = sum(1 for d in kept if d["role"] == "relevant")
+
+    if verbose:
+        if search_failures:
+            print(f"  warning: {search_failures} of 4 searches returned nothing")
+        if len(kept) < min_docs:
+            print(f"  warning: only {len(kept)} documents for {asset} {date}, "
+                  f"too thin to build a good question")
+        elif n_rel < 5:
+            print(f"  warning: only {n_rel} on-story documents "
+                  f"(distractors do not carry the answer)")
 
     return {
         "asset": asset,
@@ -195,4 +273,8 @@ def build_topic(asset: str,
         "docs": kept,
         "n_requested": len(docs),
         "n_with_text": len(kept),
+        "n_relevant": n_rel,
+        "n_distractor": len(kept) - n_rel,
+        "search_failures": search_failures,
+        "thin": len(kept) < min_docs,
     }
