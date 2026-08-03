@@ -19,16 +19,54 @@ Install only what you need:
     pip install openai anthropic google-generativeai
 """
 
+VERSION = "2026-08-03-b"
+
 import os
 import time
 from typing import Optional
 
 # Model names per provider. Update these as versions change.
+# Which model names are on the free tier changes over time. If a model
+# returns "limit: 0" it has no free allocation, and list_gemini_models()
+# will show what the key can actually reach.
 MODELS = {
     "gpt":    {"provider": "openai",    "name": "gpt-4o"},
     "claude": {"provider": "anthropic", "name": "claude-sonnet-4-5"},
-    "gemini": {"provider": "google",    "name": "gemini-2.0-flash"},
+    "gemini": {"provider": "google",
+               "name": os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")},
 }
+
+
+def set_model(key: str, name: str) -> None:
+    """Point a model key at a different underlying model name."""
+    MODELS[key]["name"] = name
+    _clients.pop(MODELS[key]["provider"], None)
+    print(f"{key} -> {name}")
+
+
+def list_gemini_models() -> list:
+    """
+    What models can this key actually use, and which support generation.
+    Run this when you hit a quota error, to find one that works.
+    """
+    names = []
+    try:
+        from google import genai as g
+        client = g.Client(api_key=os.environ["GOOGLE_API_KEY"])
+        for m in client.models.list():
+            actions = getattr(m, "supported_actions", None) or []
+            if not actions or "generateContent" in actions:
+                names.append(m.name.replace("models/", ""))
+    except ImportError:
+        import google.generativeai as g
+        g.configure(api_key=os.environ["GOOGLE_API_KEY"])
+        for m in g.list_models():
+            if "generateContent" in getattr(m, "supported_generation_methods", []):
+                names.append(m.name.replace("models/", ""))
+
+    for n in names:
+        print(" ", n)
+    return names
 
 # The three used for scoring. Deliberately one from each family.
 SCORING_MODELS = ["gpt", "claude", "gemini"]
@@ -47,9 +85,16 @@ def _get_client(provider: str):
         import anthropic
         _clients[provider] = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     elif provider == "google":
-        import google.generativeai as genai
-        genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
-        _clients[provider] = genai
+        # google.generativeai is deprecated. Prefer google.genai, fall back
+        # to the old package if only that is installed.
+        try:
+            from google import genai as new_genai
+            _clients[provider] = ("new", new_genai.Client(
+                api_key=os.environ["GOOGLE_API_KEY"]))
+        except ImportError:
+            import google.generativeai as old_genai
+            old_genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
+            _clients[provider] = ("old", old_genai)
     else:
         raise ValueError(f"unknown provider {provider}")
 
@@ -99,7 +144,16 @@ def call_model(prompt: str,
                 return resp.content[0].text
 
             if provider == "google":
-                gm = client.GenerativeModel(name)
+                kind, gclient = client
+                if kind == "new":
+                    resp = gclient.models.generate_content(
+                        model=name,
+                        contents=prompt,
+                        config={"max_output_tokens": max_tokens,
+                                "temperature": temperature},
+                    )
+                    return resp.text
+                gm = gclient.GenerativeModel(name)
                 resp = gm.generate_content(
                     prompt,
                     generation_config={"max_output_tokens": max_tokens,
@@ -109,6 +163,15 @@ def call_model(prompt: str,
 
         except Exception as e:
             last_err = e
+            msg = str(e)
+            if "limit: 0" in msg:
+                # no free-tier allocation for this model at all, so retrying
+                # will never help
+                raise RuntimeError(
+                    f"{model} ({name}) has no quota on this key.\n"
+                    f"Run llm.list_gemini_models() to see what is available, "
+                    f"then llm.set_model('gemini', '<name>').\n"
+                    f"Original error: {msg[:200]}")
             if attempt < retries - 1:
                 time.sleep(backoff * (2 ** attempt))
 
