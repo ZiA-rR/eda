@@ -170,6 +170,8 @@ def search_news(query: str,
             out = [a for a in out
                    if not a["language"] or a["language"].lower().startswith("eng")]
 
+        out = [a for a in out if not is_price_listing(a.get("title", ""))]
+
         if quality_only:
             filtered = [a for a in out if is_quality_source(a["source"])]
             if verbose and out and not filtered:
@@ -264,6 +266,39 @@ QUALITY_DOMAINS = {
     "fxstreet.com", "dailyfx.com", "forexlive.com", "seekingalpha.com",
     "morningstar.com", "yahoo.com", "fortune.com", "time.com", "newsweek.com",
 }
+
+
+
+# Some pages are permanent price tables that Google keeps in its index with
+# their original publication date but whose content updates every day. A
+# Forbes "Gold Rate Today In West Bengal" page indexed in March 2023 will
+# happily serve today's rates. They pass the domain whitelist and the date
+# filter, and they carry no explanation of anything, so they are filtered on
+# the title instead.
+PRICE_PAGE_PATTERNS = [
+    r"\brate today\b",
+    r"\bprice today\b",
+    r"\bprices today\b",
+    r"\brates today\b",
+    r"\brate on \d",
+    r"\brates on \d",
+    r"\btoday'?s? (gold|silver|price|rate)",
+    r"\bcheck today",
+    r"\bgold rate in\b",
+    r"\bprice in \w+ today\b",
+    r"\blive updates?\b",
+    r"\bper tola\b",
+    r"\b\d+ ?(karat|carat)\b",
+    r"\bcity[- ]wise\b",
+    r"\bbullion rates?\b",
+]
+
+_PRICE_RE = re.compile("|".join(PRICE_PAGE_PATTERNS), re.I)
+
+
+def is_price_listing(title: str) -> bool:
+    """Is this a daily price table rather than a news article."""
+    return bool(_PRICE_RE.search(title or ""))
 
 
 def is_quality_source(domain: str) -> bool:
@@ -426,7 +461,7 @@ def check_gdelt(verbose: bool = True) -> bool:
 
 SERPER_URL = "https://google.serper.dev/news"
 
-VERSION = "2026-08-03-e"   # bump when editing, check with retrieval.VERSION
+VERSION = "2026-08-03-f"   # bump when editing, check with retrieval.VERSION
 
 
 
@@ -553,6 +588,13 @@ def search_news_serper(query: str,
     if verbose and dropped_by_date:
         print(f"  dropped {dropped_by_date} results outside the date window")
 
+    # drop price tables before the domain filter, since some come from
+    # otherwise reputable outlets
+    n_before = len(out)
+    out = [a for a in out if not is_price_listing(a.get("title", ""))]
+    if verbose and len(out) < n_before:
+        print(f"  dropped {n_before - len(out)} daily price-listing pages")
+
     if quality_only and out:
         filtered = [a for a in out if is_quality_source(a["source"])]
         if not filtered:
@@ -626,14 +668,23 @@ def debug_search(asset: str, date: str, n: int = 20) -> None:
 
     print(f"raw results: {len(raw)}")
     for a in raw[:12]:
-        mark = "keep" if is_quality_source(a["source"]) else "drop"
+        if is_price_listing(a.get("title", "")):
+            mark = "PRIC"
+        elif is_quality_source(a["source"]):
+            mark = "keep"
+        else:
+            mark = "drop"
         rd = a.get("reported_date", "") or "NO DATE"
         parsed = _parse_serper_date(a.get("reported_date", ""), dt.date.today())
         print(f"  [{mark}] {a['source']:24s} {rd:14s} -> {str(parsed):12s} "
               f"{a['title'][:38]}")
 
-    kept = [a for a in raw if is_quality_source(a["source"])]
-    print(f"\nafter whitelist: {len(kept)} of {len(raw)}")
+    kept = [a for a in raw
+            if is_quality_source(a["source"])
+            and not is_price_listing(a.get("title", ""))]
+    n_price = sum(1 for a in raw if is_price_listing(a.get("title", "")))
+    print(f"\nprice-listing pages dropped: {n_price}")
+    print(f"after all filters: {len(kept)} of {len(raw)}")
 
     if kept:
         print("\ntesting text extraction on the first 3:")
