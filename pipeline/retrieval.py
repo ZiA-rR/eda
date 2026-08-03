@@ -226,7 +226,20 @@ def extract_text(url: str, timeout: int = 20, min_words: int = 120) -> Optional[
 # than daily price-listing pages. A bare "gold price" query returns local
 # retail listings ("Gold Rate in Pakistan Today") which carry no causal
 # content and are useless for building questions.
+# Query length matters and the right length depends on the backend.
+# GDELT matches keywords literally, so it needs several terms to avoid
+# returning price-listing pages. Google News ranks by relevance and a long
+# query plus a narrow date window returns almost nothing, so short is
+# better there.
 BASE_QUERIES = {
+    "gold":   "gold price",
+    "crypto": "bitcoin price",
+    "petrol": "oil prices",
+    "forex":  "pound sterling dollar",
+}
+
+# Longer versions, used when falling back to GDELT.
+BASE_QUERIES_GDELT = {
     "gold":   "gold prices rally investors safe haven Federal Reserve",
     "crypto": "bitcoin falls investors selloff market",
     "petrol": "oil prices crude supply OPEC market",
@@ -296,7 +309,8 @@ def build_topic(asset: str,
     search_failures = 0
 
     # on-story documents
-    hits = search(BASE_QUERIES[asset], date, max_records=n_relevant * 6)
+    queries = BASE_QUERIES if serper_available() else BASE_QUERIES_GDELT
+    hits = search(queries[asset], date, max_records=n_relevant * 4)
     if not hits:
         search_failures += 1
     for h in hits[:n_relevant]:
@@ -461,11 +475,18 @@ def search_news_serper(query: str,
             "snippet": a.get("snippet", ""),
         })
 
-    if quality_only:
+    if quality_only and out:
         filtered = [a for a in out if is_quality_source(a["source"])]
-        if verbose and out and not filtered:
-            print(f"  none of {len(out)} serper results were quality outlets")
-        out = filtered
+        if not filtered:
+            # Better to keep unknown outlets than return nothing. The
+            # extraction stage will drop anything without real content
+            # anyway, and a thin topic is worse than a slightly noisy one.
+            if verbose:
+                doms = sorted({a["source"] for a in out})[:6]
+                print(f"  no whitelisted outlets among {len(out)} results, "
+                      f"keeping all. saw: {', '.join(doms)}")
+        else:
+            out = filtered
 
     return out
 
@@ -500,3 +521,43 @@ def check_serper(verbose: bool = True) -> bool:
         if verbose:
             print(f"serper check failed: {e}")
         return False
+
+
+def debug_search(asset: str, date: str, n: int = 20) -> None:
+    """
+    Show what the search actually returns, before and after filtering.
+
+    Use this when a topic comes back thin: it tells you whether the problem
+    is the query returning nothing, or the whitelist throwing everything
+    away, or article text extraction failing.
+    """
+    backend = "serper" if serper_available() else "gdelt"
+    queries = BASE_QUERIES if serper_available() else BASE_QUERIES_GDELT
+    q = queries[asset]
+
+    print(f"backend : {backend}")
+    print(f"query   : {q!r}")
+    print(f"date    : {date}\n")
+
+    if backend == "serper":
+        raw = search_news_serper(q, date, max_records=n, quality_only=False,
+                                 verbose=False)
+    else:
+        raw = search_news(q, date, max_records=n, quality_only=False,
+                          verbose=False)
+
+    print(f"raw results: {len(raw)}")
+    for a in raw[:12]:
+        mark = "keep" if is_quality_source(a["source"]) else "drop"
+        print(f"  [{mark}] {a['source']:28s} {a['title'][:52]}")
+
+    kept = [a for a in raw if is_quality_source(a["source"])]
+    print(f"\nafter whitelist: {len(kept)} of {len(raw)}")
+
+    if kept:
+        print("\ntesting text extraction on the first 3:")
+        for a in kept[:3]:
+            txt = extract_text(a["url"])
+            n_words = len(txt.split()) if txt else 0
+            status = f"{n_words} words" if txt else "FAILED"
+            print(f"  {a['source']:28s} {status}")
