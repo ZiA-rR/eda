@@ -402,7 +402,11 @@ def build_topic(asset: str,
         hits = search(q, date, max_records=per_query * 4)
         if not hits:
             search_failures += 1
+        # skip anything already taken as on-story: a document cannot be
+        # both the evidence and the distraction
+        hits = [h for h in hits if h.get("url", "") not in seen_urls]
         for h in hits[:per_query]:
+            seen_urls.add(h.get("url", ""))
             entry = {**h, "role": "distractor"}
             if fetch_text:
                 txt = extract_text(h["url"])
@@ -493,7 +497,7 @@ def check_gdelt(verbose: bool = True) -> bool:
 
 SERPER_URL = "https://google.serper.dev/news"
 
-VERSION = "2026-08-03-g"   # bump when editing, check with retrieval.VERSION
+VERSION = "2026-08-03-h"   # bump when editing, check with retrieval.VERSION
 
 
 
