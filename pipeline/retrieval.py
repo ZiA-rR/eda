@@ -91,7 +91,7 @@ def _gdelt_wait():
 
 def search_news(query: str,
                 date: str,
-                days_before: int = 2,
+                days_before: int = 4,
                 days_after: int = 1,
                 max_records: int = 40,
                 timeout: int = 30,
@@ -234,19 +234,27 @@ def extract_text(url: str, timeout: int = 20, min_words: int = 120) -> Optional[
 # returning price-listing pages. Google News ranks by relevance and a long
 # query plus a narrow date window returns almost nothing, so short is
 # better there.
+# One query returns roughly ten results for a narrow date window, which is
+# nowhere near AER's ~20 documents per topic. Several angles on the same
+# story bring in different reporting: the price move itself, the market
+# reaction, and the macro driver.
 BASE_QUERIES = {
-    "gold":   "gold price",
-    "crypto": "bitcoin price",
-    "petrol": "oil prices",
-    "forex":  "pound sterling dollar",
+    "gold":   ["gold price", "gold market investors", "gold safe haven demand",
+               "precious metals gold silver"],
+    "crypto": ["bitcoin price", "bitcoin market selloff", "crypto market investors",
+               "cryptocurrency bitcoin trading"],
+    "petrol": ["oil prices", "crude oil market", "brent crude supply",
+               "oil market OPEC"],
+    "forex":  ["pound sterling dollar", "sterling currency markets",
+               "pound exchange rate", "sterling Bank of England"],
 }
 
 # Longer versions, used when falling back to GDELT.
 BASE_QUERIES_GDELT = {
-    "gold":   "gold prices rally investors safe haven Federal Reserve",
-    "crypto": "bitcoin falls investors selloff market",
-    "petrol": "oil prices crude supply OPEC market",
-    "forex":  "sterling pound falls dollar markets Bank of England",
+    "gold":   ["gold prices rally investors safe haven Federal Reserve"],
+    "crypto": ["bitcoin falls investors selloff market"],
+    "petrol": ["oil prices crude supply OPEC market"],
+    "forex":  ["sterling pound falls dollar markets Bank of England"],
 }
 
 # Only keep articles from outlets that actually do financial journalism.
@@ -264,6 +272,13 @@ QUALITY_DOMAINS = {
     "kitco.com", "mining.com", "oilprice.com", "rigzone.com", "spglobal.com",
     "coindesk.com", "cointelegraph.com", "theblock.co", "decrypt.co",
     "fxstreet.com", "dailyfx.com", "forexlive.com", "seekingalpha.com",
+    "miningweekly.com", "tradingview.com", "investopedia.com", "nypost.com",
+    "thestreet.com", "benzinga.com", "zerohedge.com", "moneycontrol.com",
+    "livemint.com", "economictimes.indiatimes.com", "business-standard.com",
+    "cnbctv18.com", "financialexpress.com", "gulfnews.com", "arabnews.com",
+    "english.alarabiya.net", "channelnewsasia.com", "straitstimes.com",
+    "theedgemalaysia.com", "visualcapitalist.com", "statista.com",
+    "worldgoldcouncil.org", "lbma.org.uk", "bullionvault.com", "goldhub.com",
     "morningstar.com", "yahoo.com", "fortune.com", "time.com", "newsweek.com",
 }
 
@@ -346,9 +361,26 @@ def build_topic(asset: str,
 
     # on-story documents
     queries = BASE_QUERIES if serper_available() else BASE_QUERIES_GDELT
-    hits = search(queries[asset], date, max_records=n_relevant * 4)
-    if not hits:
-        search_failures += 1
+    q_list = queries[asset]
+    if isinstance(q_list, str):
+        q_list = [q_list]
+
+    hits, seen_urls = [], set()
+    for q in q_list:
+        got = search(q, date, max_records=30)
+        if not got:
+            search_failures += 1
+        for h in got:
+            u = h.get("url", "")
+            if u and u not in seen_urls:
+                seen_urls.add(u)
+                hits.append(h)
+        if len(hits) >= n_relevant:
+            break
+
+    if verbose:
+        print(f"  {len(hits)} unique on-story articles from "
+              f"{len(q_list)} query angles")
     for h in hits[:n_relevant]:
         entry = {**h, "role": "relevant"}
         if fetch_text:
@@ -461,7 +493,7 @@ def check_gdelt(verbose: bool = True) -> bool:
 
 SERPER_URL = "https://google.serper.dev/news"
 
-VERSION = "2026-08-03-f"   # bump when editing, check with retrieval.VERSION
+VERSION = "2026-08-03-g"   # bump when editing, check with retrieval.VERSION
 
 
 
@@ -502,7 +534,7 @@ def serper_available() -> bool:
 
 def search_news_serper(query: str,
                        date: str,
-                       days_before: int = 2,
+                       days_before: int = 4,
                        days_after: int = 1,
                        max_records: int = 20,
                        english_only: bool = True,
@@ -654,6 +686,8 @@ def debug_search(asset: str, date: str, n: int = 20) -> None:
     backend = "serper" if serper_available() else "gdelt"
     queries = BASE_QUERIES if serper_available() else BASE_QUERIES_GDELT
     q = queries[asset]
+    if isinstance(q, list):
+        q = q[0]
 
     print(f"backend : {backend}")
     print(f"query   : {q!r}")
