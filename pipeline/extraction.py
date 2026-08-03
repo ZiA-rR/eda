@@ -11,6 +11,7 @@ rather than a single verb phrase.
 
 Each extracted event carries its source document and a date, because
 temporal ordering is what lets us later tell causes from consequences.
+VERSION = "2026-08-03-b"
 """
 
 import json
@@ -21,19 +22,42 @@ from typing import List, Dict, Optional
 from llm import call_model     # provider-agnostic wrapper, see llm.py
 
 
-EXTRACTION_PROMPT = """You are extracting events from a financial news article.
+EXTRACTION_PROMPT = """You are finding possible CAUSES of a specific market move.
 
-List the main events this article reports. An event is something that
-happened: a decision, an announcement, a market move, a policy change, a
-failure, a disruption.
+THE MOVE TO BE EXPLAINED:
+{target}
 
-Rules:
-- Each event must be one self-contained sentence.
-- Include specific figures, names and dates where the article gives them.
-- Do not include opinion, prediction, or analyst commentary. Only things
-  that actually happened.
-- Do not include the article's own framing ("this article explains...").
-- If the article reports no concrete events, return an empty list.
+Read the article below and list events that could help explain why that move
+happened. An event is something that occurred: a decision, an announcement, a
+policy change, a failure, a disruption, a regulatory action, a large trade, a
+statement by someone influential.
+
+CRITICAL: do NOT list the price move itself, or any description of it. Those
+are the thing being explained, not an explanation. Specifically exclude:
+- any statement of what the price was, or how much it rose or fell
+  ("bitcoin traded at $4,190", "the price gained 14 percent")
+- trading volume, order book or liquidity statistics
+- technical analysis (moving averages, support levels, chart patterns)
+- descriptions of the move happening ("prices surged", "the rally continued")
+- other assets moving in the same direction at the same time
+- analyst opinion, forecasts, or predictions
+
+DO list things like:
+- a central bank decision or signal
+- a bank failure, bankruptcy or default
+- a regulatory or legal action
+- a geopolitical event, conflict or sanction
+- a supply disruption or production decision
+- a large identifiable transaction or liquidation
+- an economic data release
+- a public statement by a government, company or major investor
+
+Each event must be one self-contained sentence with the specific names,
+figures and dates the article gives.
+
+If the article contains no such events, return an empty list. An empty list is
+the right answer more often than you might expect: many articles only report
+the move itself.
 
 Article published: {date}
 Article source: {source}
@@ -42,7 +66,7 @@ ARTICLE:
 {text}
 
 Return ONLY a JSON list of strings, no other text. Example:
-["The Federal Reserve raised its policy rate by 25 basis points on 22 March.", "..."]
+["California regulators closed Silicon Valley Bank on 10 March."]
 """
 
 
@@ -75,6 +99,7 @@ def _parse_json_list(raw: str) -> List[str]:
 
 
 def extract_events_from_doc(doc: Dict,
+                            target_event: str = "",
                             model: str = "claude",
                             max_chars: int = 6000) -> List[Dict]:
     """
@@ -88,6 +113,7 @@ def extract_events_from_doc(doc: Dict,
         return []
 
     prompt = EXTRACTION_PROMPT.format(
+        target=target_event or "an unusually large move in this asset's price",
         date=doc.get("date", "unknown"),
         source=doc.get("source", "unknown"),
         text=text[:max_chars],
@@ -123,6 +149,27 @@ def filter_events(events: List[Dict],
         "believes", "according to analysts",
     ]
 
+    # Restatements of the move itself. The prompt asks the model to skip
+    # these but some always get through, and they are worse than useless as
+    # candidate causes because they are guaranteed to look related.
+    PRICE_DESCRIPTION = [
+        "moving average", "support level", "resistance", "chart",
+        "trading volume", "was priced at", "traded at", "price rose",
+        "price fell", "price spiked", "price surged", "price climbed",
+        "price dropped", "gain of", "loss of", "percent in the last",
+        "highest since", "lowest since", "market cap", "order book",
+        "btc/usd", "trading session", "leveled out", "rallied to",
+        "24 hours", "intraday",
+        # movement verbs applied to the asset itself
+        "spiked", "surged", "soared", "plunged", "tumbled", "slumped",
+        "the surge", "the rally", "the selloff", "the plunge",
+        "sudden rise", "sudden fall", "sharp rise", "sharp drop",
+        "big revival", "enjoying the", "experienced a", "climbed to",
+        "jumped to", "fell to", "rose to", "hit a high", "hit a low",
+        "record high", "record low", "week high", "week low",
+        "month high", "month low", "all-time high", "all-time low",
+    ]
+
     kept = []
     for e in events:
         t = e["text"].strip()
@@ -131,6 +178,8 @@ def filter_events(events: List[Dict],
             continue
         low = t.lower()
         if any(m in low for m in OPINION_MARKERS):
+            continue
+        if any(m in low for m in PRICE_DESCRIPTION):
             continue
         kept.append(e)
     return kept
@@ -232,7 +281,8 @@ def extract_candidates_for_topic(topic: Dict,
     """
     all_events = []
     for i, doc in enumerate(topic["docs"], 1):
-        evs = extract_events_from_doc(doc, model=model)
+        evs = extract_events_from_doc(
+            doc, target_event=topic.get("target_event", ""), model=model)
         all_events.extend(evs)
         if verbose:
             print(f"    doc {i}/{len(topic['docs'])}: {len(evs)} events")
