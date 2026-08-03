@@ -15,12 +15,17 @@ swapped. AER used serper.dev (Google News), which is paid but gives better
 coverage. GDELT is the free option and is good enough to start.
 """
 
+import logging
 import time
 import datetime as dt
 from typing import List, Dict, Optional
 
 import pandas as pd
 import requests
+
+# trafilatura logs an ERROR for every blocked or paywalled URL. Those
+# failures are expected and routine, and the noise buries everything else.
+logging.getLogger("trafilatura").setLevel(logging.CRITICAL)
 
 
 # ---------------------------------------------------------------- tickers
@@ -69,7 +74,7 @@ GDELT_URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 #
 # This is enforced inside search_news rather than passed in as an option,
 # because every caller needs it and forgetting is the whole problem.
-GDELT_MIN_INTERVAL = 6.0
+GDELT_MIN_INTERVAL = 12.0
 _last_gdelt_call = 0.0
 
 
@@ -89,6 +94,7 @@ def search_news(query: str,
                 max_records: int = 40,
                 timeout: int = 30,
                 english_only: bool = True,
+                quality_only: bool = True,
                 retries: int = 4,
                 verbose: bool = True) -> List[Dict]:
     """
@@ -103,6 +109,9 @@ def search_news(query: str,
     english_only: GDELT indexes many languages. Without this you get
                   Romanian and Spanish articles mixed in, which the
                   extraction stage cannot use.
+    quality_only: keep only recognised financial and news outlets. Without
+                  this the results fill up with price-listing pages from
+                  local papers, which contain no explanation of anything.
 
     Waits between calls and retries on 429 with escalating backoff.
     """
@@ -158,28 +167,53 @@ def search_news(query: str,
         if english_only:
             out = [a for a in out
                    if not a["language"] or a["language"].lower().startswith("eng")]
+
+        if quality_only:
+            filtered = [a for a in out if is_quality_source(a["source"])]
+            if verbose and out and not filtered:
+                print(f"  none of {len(out)} results were from quality outlets")
+            out = filtered
+
         return out
 
     print(f"  GDELT gave up on '{query}' after {retries} attempts")
     return []
 
 
-def extract_text(url: str, timeout: int = 20) -> Optional[str]:
+BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/120.0.0.0 Safari/537.36")
+
+
+def extract_text(url: str, timeout: int = 20, min_words: int = 120) -> Optional[str]:
     """
     Pull the main body text from an article URL.
 
         pip install trafilatura
 
-    Returns None on paywalls, blocks, or extraction failure, which is
-    common. Expect to lose a meaningful share of URLs.
+    Fetches with requests using a browser user agent rather than letting
+    trafilatura use its default, because many news sites return 403 to
+    anything that looks automated.
+
+    min_words drops stubs: cookie notices, "subscribe to continue" pages and
+    paywall teasers extract fine but contain no article. A real news article
+    is well over 120 words.
+
+    Returns None on paywalls, blocks or extraction failure, which is common.
+    Expect to lose a meaningful share of URLs whatever you do.
     """
     import trafilatura
     try:
-        downloaded = trafilatura.fetch_url(url)
-        if not downloaded:
+        resp = requests.get(url, timeout=timeout,
+                            headers={"User-Agent": BROWSER_UA,
+                                     "Accept-Language": "en-US,en;q=0.9"})
+        if resp.status_code != 200:
             return None
-        text = trafilatura.extract(downloaded, include_comments=False,
+
+        text = trafilatura.extract(resp.text, include_comments=False,
                                    include_tables=False)
+        if not text or len(text.split()) < min_words:
+            return None
         return text
     except Exception:
         return None
@@ -187,12 +221,42 @@ def extract_text(url: str, timeout: int = 20) -> Optional[str]:
 
 # ------------------------------------------------------- query building
 # Queries for the on-story documents, per asset.
+# Queries have to be specific enough to return financial ANALYSIS rather
+# than daily price-listing pages. A bare "gold price" query returns local
+# retail listings ("Gold Rate in Pakistan Today") which carry no causal
+# content and are useless for building questions.
 BASE_QUERIES = {
-    "gold":   "gold price",
-    "crypto": "bitcoin price",
-    "petrol": "oil price crude",
-    "forex":  "pound sterling dollar",
+    "gold":   "gold prices rally investors safe haven Federal Reserve",
+    "crypto": "bitcoin falls investors selloff market",
+    "petrol": "oil prices crude supply OPEC market",
+    "forex":  "sterling pound falls dollar markets Bank of England",
 }
+
+# Only keep articles from outlets that actually do financial journalism.
+# GDELT indexes an enormous long tail of aggregators and local papers that
+# republish price tables. Those pass a keyword filter but carry no
+# explanation of why anything moved.
+QUALITY_DOMAINS = {
+    "reuters.com", "bloomberg.com", "ft.com", "cnbc.com", "wsj.com",
+    "marketwatch.com", "investing.com", "barrons.com", "economist.com",
+    "apnews.com", "theguardian.com", "bbc.com", "bbc.co.uk", "nytimes.com",
+    "washingtonpost.com", "forbes.com", "businessinsider.com", "axios.com",
+    "cnn.com", "nbcnews.com", "abcnews.go.com", "cbsnews.com", "npr.org",
+    "telegraph.co.uk", "thetimes.co.uk", "independent.co.uk", "standard.co.uk",
+    "aljazeera.com", "dw.com", "france24.com", "scmp.com", "japantimes.co.jp",
+    "kitco.com", "mining.com", "oilprice.com", "rigzone.com", "spglobal.com",
+    "coindesk.com", "cointelegraph.com", "theblock.co", "decrypt.co",
+    "fxstreet.com", "dailyfx.com", "forexlive.com", "seekingalpha.com",
+    "morningstar.com", "yahoo.com", "fortune.com", "time.com", "newsweek.com",
+}
+
+
+def is_quality_source(domain: str) -> bool:
+    """Is this outlet one we want text from."""
+    if not domain:
+        return False
+    d = domain.lower().replace("www.", "")
+    return any(d == q or d.endswith("." + q) for q in QUALITY_DOMAINS)
 
 # Distractor queries: topically adjacent, but likely to return articles
 # OUTSIDE the causal chain of any specific day's move. This mirrors what AER
@@ -231,7 +295,7 @@ def build_topic(asset: str,
     search_failures = 0
 
     # on-story documents
-    hits = search_news(BASE_QUERIES[asset], date, max_records=n_relevant * 2)
+    hits = search_news(BASE_QUERIES[asset], date, max_records=n_relevant * 6)
     if not hits:
         search_failures += 1
     for h in hits[:n_relevant]:
@@ -278,3 +342,38 @@ def build_topic(asset: str,
         "search_failures": search_failures,
         "thin": len(kept) < min_docs,
     }
+
+
+# ------------------------------------------------------------ diagnostics
+def check_gdelt(verbose: bool = True) -> bool:
+    """
+    Is GDELT actually reachable and not rate limiting us right now.
+
+    Colab hands out shared IP addresses, so other people's requests count
+    against the same limit. Some sessions are simply unusable, and it is
+    better to find out in ten seconds than forty minutes into a run.
+    """
+    try:
+        _gdelt_wait()
+        resp = requests.get(GDELT_URL,
+                            params={"query": "markets sourcelang:english",
+                                    "mode": "artlist", "maxrecords": 5,
+                                    "format": "json"},
+                            timeout=20,
+                            headers={"User-Agent": "research-dataset-builder"})
+        if resp.status_code == 429:
+            if verbose:
+                print("GDELT is rate limiting this IP.")
+                print("Colab shares IPs, so this is often not your fault.")
+                print("Options: wait and retry, or Runtime > Disconnect and")
+                print("delete runtime to get a new IP, then reconnect.")
+            return False
+        resp.raise_for_status()
+        n = len(resp.json().get("articles", []))
+        if verbose:
+            print(f"GDELT is responding, {n} articles for a test query")
+        return True
+    except Exception as e:
+        if verbose:
+            print(f"GDELT check failed: {type(e).__name__}: {e}")
+        return False
