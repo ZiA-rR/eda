@@ -16,6 +16,7 @@ coverage. GDELT is the free option and is good enough to start.
 """
 
 import logging
+import os
 import time
 import datetime as dt
 from typing import List, Dict, Optional
@@ -295,7 +296,7 @@ def build_topic(asset: str,
     search_failures = 0
 
     # on-story documents
-    hits = search_news(BASE_QUERIES[asset], date, max_records=n_relevant * 6)
+    hits = search(BASE_QUERIES[asset], date, max_records=n_relevant * 6)
     if not hits:
         search_failures += 1
     for h in hits[:n_relevant]:
@@ -308,7 +309,7 @@ def build_topic(asset: str,
     # distractor documents
     per_query = max(1, n_distractor // len(DISTRACTOR_QUERIES[asset]))
     for q in DISTRACTOR_QUERIES[asset]:
-        hits = search_news(q, date, max_records=per_query * 2)
+        hits = search(q, date, max_records=per_query * 4)
         if not hits:
             search_failures += 1
         for h in hits[:per_query]:
@@ -376,4 +377,126 @@ def check_gdelt(verbose: bool = True) -> bool:
     except Exception as e:
         if verbose:
             print(f"GDELT check failed: {type(e).__name__}: {e}")
+        return False
+
+
+# ---------------------------------------------------------------- serper
+# GDELT rate-limits per IP, and Colab hands out shared IPs, so on a bad day
+# every request comes back 429 no matter how slowly you go. Serper is the
+# fallback: it wraps Google News, gives 2,500 free queries without a card,
+# and is what the AER team used.
+#
+#   1. sign up at serper.dev
+#   2. copy the API key
+#   3. os.environ["SERPER_API_KEY"] = "..."
+#
+# At four searches per topic, the free allowance covers about 600 topics.
+
+SERPER_URL = "https://google.serper.dev/news"
+
+
+def serper_available() -> bool:
+    return bool(os.environ.get("SERPER_API_KEY"))
+
+
+def search_news_serper(query: str,
+                       date: str,
+                       days_before: int = 2,
+                       days_after: int = 1,
+                       max_records: int = 20,
+                       english_only: bool = True,
+                       quality_only: bool = True,
+                       timeout: int = 30,
+                       verbose: bool = True) -> List[Dict]:
+    """
+    Same contract as search_news, but via Serper's Google News endpoint.
+
+    Date filtering uses Google's tbs parameter, which wants US-style
+    m/d/yyyy dates.
+    """
+    key = os.environ.get("SERPER_API_KEY")
+    if not key:
+        raise RuntimeError("SERPER_API_KEY is not set")
+
+    d = dt.datetime.strptime(date, "%Y-%m-%d")
+    lo = d - dt.timedelta(days=days_before)
+    hi = d + dt.timedelta(days=days_after)
+    tbs = (f"cdr:1,cd_min:{lo.month}/{lo.day}/{lo.year},"
+           f"cd_max:{hi.month}/{hi.day}/{hi.year}")
+
+    payload = {"q": query, "num": min(max_records, 100), "tbs": tbs}
+    if english_only:
+        payload["gl"] = "us"
+        payload["hl"] = "en"
+
+    try:
+        resp = requests.post(SERPER_URL, json=payload, timeout=timeout,
+                             headers={"X-API-KEY": key,
+                                      "Content-Type": "application/json"})
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        if verbose:
+            print(f"  serper failed for '{query}': {e}")
+        return []
+
+    out = []
+    for a in data.get("news", []):
+        link = a.get("link", "")
+        # serper reports the outlet name, not the domain, so take the
+        # domain from the URL to keep the whitelist check working
+        domain = ""
+        try:
+            from urllib.parse import urlparse
+            domain = urlparse(link).netloc.replace("www.", "")
+        except Exception:
+            pass
+        out.append({
+            "title": a.get("title", ""),
+            "url": link,
+            "source": domain or a.get("source", ""),
+            "date": date,          # serper gives relative dates, so use the
+                                   # window we asked for
+            "language": "eng",
+            "snippet": a.get("snippet", ""),
+        })
+
+    if quality_only:
+        filtered = [a for a in out if is_quality_source(a["source"])]
+        if verbose and out and not filtered:
+            print(f"  none of {len(out)} serper results were quality outlets")
+        out = filtered
+
+    return out
+
+
+def search(query: str, date: str, **kw) -> List[Dict]:
+    """
+    Search using whichever backend is available.
+
+    Serper first when a key is set, since it is more reliable and gives
+    better results. GDELT otherwise.
+    """
+    if serper_available():
+        return search_news_serper(query, date, **kw)
+    return search_news(query, date, **kw)
+
+
+def check_serper(verbose: bool = True) -> bool:
+    """Is the serper key set and working."""
+    if not serper_available():
+        if verbose:
+            print("SERPER_API_KEY is not set.")
+            print("Sign up free at serper.dev, then:")
+            print('  os.environ["SERPER_API_KEY"] = "your-key"')
+        return False
+    try:
+        hits = search_news_serper("markets", "2023-03-13", quality_only=False,
+                                  max_records=5, verbose=False)
+        if verbose:
+            print(f"serper is working, {len(hits)} results for a test query")
+        return bool(hits)
+    except Exception as e:
+        if verbose:
+            print(f"serper check failed: {e}")
         return False
