@@ -17,6 +17,7 @@ coverage. GDELT is the free option and is good enough to start.
 
 import logging
 import os
+import re
 import time
 import datetime as dt
 from typing import List, Dict, Optional
@@ -316,7 +317,15 @@ def build_topic(asset: str,
     for h in hits[:n_relevant]:
         entry = {**h, "role": "relevant"}
         if fetch_text:
-            entry["content"] = extract_text(h["url"])
+            txt = extract_text(h["url"])
+            if not txt and h.get("snippet"):
+                # Reuters, Bloomberg, FT and others block scrapers. The
+                # search snippet is only a sentence or two, but a headline
+                # plus a sentence from Reuters still carries a real event,
+                # and losing those outlets entirely is worse.
+                txt = f"{h.get('title','')}. {h['snippet']}"
+                entry["content_is_snippet"] = True
+            entry["content"] = txt
             time.sleep(polite_delay)
         docs.append(entry)
 
@@ -329,12 +338,17 @@ def build_topic(asset: str,
         for h in hits[:per_query]:
             entry = {**h, "role": "distractor"}
             if fetch_text:
-                entry["content"] = extract_text(h["url"])
+                txt = extract_text(h["url"])
+                if not txt and h.get("snippet"):
+                    txt = f"{h.get('title','')}. {h['snippet']}"
+                    entry["content_is_snippet"] = True
+                entry["content"] = txt
                 time.sleep(polite_delay)
             docs.append(entry)
 
     kept = [d for d in docs if not fetch_text or d.get("content")]
     n_rel = sum(1 for d in kept if d["role"] == "relevant")
+    n_snip = sum(1 for d in kept if d.get("content_is_snippet"))
 
     if verbose:
         if search_failures:
@@ -345,6 +359,9 @@ def build_topic(asset: str,
         elif n_rel < 5:
             print(f"  warning: only {n_rel} on-story documents "
                   f"(distractors do not carry the answer)")
+        if n_snip:
+            print(f"  note: {n_snip} of {len(kept)} are snippet-only "
+                  f"(site blocked full text)")
 
     return {
         "asset": asset,
@@ -355,6 +372,7 @@ def build_topic(asset: str,
         "n_relevant": n_rel,
         "n_distractor": len(kept) - n_rel,
         "search_failures": search_failures,
+        "n_snippet_only": n_snip,
         "thin": len(kept) < min_docs,
     }
 
@@ -409,6 +427,34 @@ def check_gdelt(verbose: bool = True) -> bool:
 SERPER_URL = "https://google.serper.dev/news"
 
 
+
+def _parse_serper_date(s: str, reference: dt.date) -> Optional[dt.date]:
+    """
+    Serper reports article dates inconsistently: sometimes "2 days ago",
+    sometimes "Mar 13, 2023", sometimes nothing. Parse what we can.
+
+    reference is the date the search was anchored on, used to resolve
+    relative strings.
+    """
+    if not s:
+        return None
+    s = str(s).strip().lower()
+
+    m = re.match(r"(\d+)\s+(minute|hour|day|week|month|year)s?\s+ago", s)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        days = {"minute": 0, "hour": 0, "day": 1,
+                "week": 7, "month": 30, "year": 365}[unit] * n
+        return reference - dt.timedelta(days=days)
+
+    for fmt in ("%b %d, %Y", "%B %d, %Y", "%Y-%m-%d", "%d %b %Y", "%m/%d/%Y"):
+        try:
+            return dt.datetime.strptime(s.title(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
 def serper_available() -> bool:
     return bool(os.environ.get("SERPER_API_KEY"))
 
@@ -454,9 +500,21 @@ def search_news_serper(query: str,
             print(f"  serper failed for '{query}': {e}")
         return []
 
+    # The news endpoint accepts tbs but does not reliably honour it, so
+    # results outside the window get filtered out here as well.
+    lo_d, hi_d = lo.date(), hi.date()
+
     out = []
+    dropped_by_date = 0
     for a in data.get("news", []):
         link = a.get("link", "")
+
+        art_date = _parse_serper_date(a.get("date", ""), d.date())
+        if art_date and not (lo_d - dt.timedelta(days=1)
+                             <= art_date
+                             <= hi_d + dt.timedelta(days=1)):
+            dropped_by_date += 1
+            continue
         # serper reports the outlet name, not the domain, so take the
         # domain from the URL to keep the whitelist check working
         domain = ""
@@ -473,7 +531,11 @@ def search_news_serper(query: str,
                                    # window we asked for
             "language": "eng",
             "snippet": a.get("snippet", ""),
+            "reported_date": a.get("date", ""),
         })
+
+    if verbose and dropped_by_date:
+        print(f"  dropped {dropped_by_date} results outside the date window")
 
     if quality_only and out:
         filtered = [a for a in out if is_quality_source(a["source"])]
