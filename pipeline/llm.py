@@ -19,7 +19,7 @@ Install only what you need:
     pip install openai anthropic google-generativeai
 """
 
-VERSION = "2026-08-03-b"
+VERSION = "2026-08-03-c"
 
 import os
 import time
@@ -146,13 +146,33 @@ def call_model(prompt: str,
             if provider == "google":
                 kind, gclient = client
                 if kind == "new":
+                    cfg = {"max_output_tokens": max_tokens,
+                           "temperature": temperature}
+                    # Gemini 2.5 and later spend output tokens on internal
+                    # reasoning before answering. For structured extraction
+                    # and scoring we want the answer, not the reasoning, and
+                    # leaving thinking on means the budget gets eaten and
+                    # .text comes back empty.
+                    if any(v in name for v in ("2.5", "3.", "-latest")):
+                        cfg["thinking_config"] = {"thinking_budget": 0}
+
                     resp = gclient.models.generate_content(
-                        model=name,
-                        contents=prompt,
-                        config={"max_output_tokens": max_tokens,
-                                "temperature": temperature},
-                    )
-                    return resp.text
+                        model=name, contents=prompt, config=cfg)
+
+                    text = getattr(resp, "text", None)
+                    if text:
+                        return text
+
+                    # empty response: work out why rather than returning None
+                    reason = "unknown"
+                    try:
+                        cand = resp.candidates[0]
+                        reason = str(getattr(cand, "finish_reason", "unknown"))
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"{name} returned no text (finish_reason={reason}). "
+                        f"If this says MAX_TOKENS, raise max_tokens.")
                 gm = gclient.GenerativeModel(name)
                 resp = gm.generate_content(
                     prompt,
