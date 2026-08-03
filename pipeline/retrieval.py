@@ -426,6 +426,8 @@ def check_gdelt(verbose: bool = True) -> bool:
 
 SERPER_URL = "https://google.serper.dev/news"
 
+VERSION = "2026-08-03-d"   # bump when editing, check with retrieval.VERSION
+
 
 
 def _parse_serper_date(s: str, reference: dt.date) -> Optional[dt.date]:
@@ -433,8 +435,8 @@ def _parse_serper_date(s: str, reference: dt.date) -> Optional[dt.date]:
     Serper reports article dates inconsistently: sometimes "2 days ago",
     sometimes "Mar 13, 2023", sometimes nothing. Parse what we can.
 
-    reference is the date the search was anchored on, used to resolve
-    relative strings.
+    reference is kept for the signature but relative strings resolve
+    against today, since that is what "2 hours ago" actually means.
     """
     if not s:
         return None
@@ -445,7 +447,11 @@ def _parse_serper_date(s: str, reference: dt.date) -> Optional[dt.date]:
         n, unit = int(m.group(1)), m.group(2)
         days = {"minute": 0, "hour": 0, "day": 1,
                 "week": 7, "month": 30, "year": 365}[unit] * n
-        return reference - dt.timedelta(days=days)
+        # Relative dates are relative to NOW, never to the date being
+        # searched for. Resolving "2 hours ago" against the search anchor
+        # makes every fresh article look like it was published on the day
+        # we asked about, which is exactly backwards.
+        return dt.date.today() - dt.timedelta(days=days)
 
     for fmt in ("%b %d, %Y", "%B %d, %Y", "%Y-%m-%d", "%d %b %Y", "%m/%d/%Y"):
         try:
@@ -620,6 +626,11 @@ def debug_search(asset: str, date: str, n: int = 20) -> None:
         print("\ntesting text extraction on the first 3:")
         for a in kept[:3]:
             txt = extract_text(a["url"])
-            n_words = len(txt.split()) if txt else 0
-            status = f"{n_words} words" if txt else "FAILED"
+            if txt:
+                status = f"{len(txt.split())} words (full)"
+            elif a.get("snippet"):
+                n = len(f"{a.get('title','')}. {a['snippet']}".split())
+                status = f"{n} words (snippet fallback)"
+            else:
+                status = "FAILED, no snippet either"
             print(f"  {a['source']:28s} {status}")
