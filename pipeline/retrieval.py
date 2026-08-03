@@ -426,7 +426,7 @@ def check_gdelt(verbose: bool = True) -> bool:
 
 SERPER_URL = "https://google.serper.dev/news"
 
-VERSION = "2026-08-03-d"   # bump when editing, check with retrieval.VERSION
+VERSION = "2026-08-03-e"   # bump when editing, check with retrieval.VERSION
 
 
 
@@ -472,6 +472,7 @@ def search_news_serper(query: str,
                        max_records: int = 20,
                        english_only: bool = True,
                        quality_only: bool = True,
+                       strict_dates: bool = True,
                        timeout: int = 30,
                        verbose: bool = True) -> List[Dict]:
     """
@@ -516,9 +517,18 @@ def search_news_serper(query: str,
         link = a.get("link", "")
 
         art_date = _parse_serper_date(a.get("date", ""), d.date())
-        if art_date and not (lo_d - dt.timedelta(days=1)
-                             <= art_date
-                             <= hi_d + dt.timedelta(days=1)):
+
+        if art_date is None:
+            # Serper does not always report a date. For a historical
+            # search that is a problem, because the results that leak in
+            # are current ones. Anything more than a month old is safely
+            # historical, so only apply this when searching the past.
+            if strict_dates and (dt.date.today() - d.date()).days > 30:
+                dropped_by_date += 1
+                continue
+        elif not (lo_d - dt.timedelta(days=1)
+                  <= art_date
+                  <= hi_d + dt.timedelta(days=1)):
             dropped_by_date += 1
             continue
         # serper reports the outlet name, not the domain, so take the
@@ -609,7 +619,7 @@ def debug_search(asset: str, date: str, n: int = 20) -> None:
 
     if backend == "serper":
         raw = search_news_serper(q, date, max_records=n, quality_only=False,
-                                 verbose=False)
+                                 strict_dates=False, verbose=False)
     else:
         raw = search_news(q, date, max_records=n, quality_only=False,
                           verbose=False)
@@ -617,7 +627,10 @@ def debug_search(asset: str, date: str, n: int = 20) -> None:
     print(f"raw results: {len(raw)}")
     for a in raw[:12]:
         mark = "keep" if is_quality_source(a["source"]) else "drop"
-        print(f"  [{mark}] {a['source']:28s} {a['title'][:52]}")
+        rd = a.get("reported_date", "") or "NO DATE"
+        parsed = _parse_serper_date(a.get("reported_date", ""), dt.date.today())
+        print(f"  [{mark}] {a['source']:24s} {rd:14s} -> {str(parsed):12s} "
+              f"{a['title'][:38]}")
 
     kept = [a for a in raw if is_quality_source(a["source"])]
     print(f"\nafter whitelist: {len(kept)} of {len(raw)}")
