@@ -26,6 +26,7 @@ Second, the assembly actively resists the two shortcuts found in AER.
     are merged rather than repeated.
 """
 
+import datetime as dt
 import random
 import re
 import statistics
@@ -42,7 +43,7 @@ def classify_distractor(cand: Dict, target_entities: set) -> str:
     if cand.get("position") == "after":
         return "temporal"
 
-    score = cand.get("consensus", 0)
+    score = cand.get("consensus")
     if score == 1:
         return "background"
 
@@ -141,6 +142,49 @@ def build_distractor_pool(topics: List[Dict]) -> Dict[str, List[Dict]]:
     return pool
 
 
+def _date_leaks(text: str, event_date: str, months: int = 3) -> bool:
+    """
+    Does this candidate name a date far from the event.
+
+    A distractor dated September for a July question is rejectable without
+    any reasoning at all, which is exactly the kind of shortcut the whole
+    design is meant to avoid.
+    """
+    if not event_date:
+        return False
+    try:
+        ev = dt.datetime.strptime(event_date, "%Y-%m-%d").date()
+    except ValueError:
+        return False
+
+    # explicit years that are not the event's year
+    years = re.findall(r"\b(19|20)\d{2}\b", text)
+    full_years = re.findall(r"\b((?:19|20)\d{2})\b", text)
+    for y in full_years:
+        if abs(int(y) - ev.year) >= 1:
+            return True
+
+    # ISO dates
+    for m in re.finditer(r"\b(\d{4})-(\d{2})-(\d{2})\b", text):
+        try:
+            d = dt.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            continue
+        if abs((d - ev).days) > months * 31:
+            return True
+
+    # "March 7", "September 3" style, checked against the event month
+    MONTHS = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
+              "july":7,"august":8,"september":9,"october":10,"november":11,
+              "december":12}
+    for name, num in MONTHS.items():
+        if re.search(rf"\b{name}\b", text, re.I):
+            gap = min(abs(num - ev.month), 12 - abs(num - ev.month))
+            if gap > months:
+                return True
+    return False
+
+
 def _cross_topic_distractors(topic: Dict,
                              pool: Dict[str, List[Dict]],
                              n_needed: int,
@@ -162,6 +206,25 @@ def _cross_topic_distractors(topic: Dict,
     # never reuse text that already appears in this topic
     own = {c["text"].strip().lower() for c in topic.get("candidates", [])}
     others = [c for c in others if c["text"].strip().lower() not in own]
+
+    event_date = topic.get("event_date", "")
+
+    # prefer distractors from events close in time, so the borrowed option
+    # is plausible for this date rather than obviously from another year
+    def _months_apart(c):
+        try:
+            a_d = dt.datetime.strptime(event_date, "%Y-%m-%d").date()
+            b_d = dt.datetime.strptime(c.get("from_date", ""), "%Y-%m-%d").date()
+            return abs((a_d - b_d).days) / 30.0
+        except (ValueError, TypeError):
+            return 999.0
+
+    # drop any whose own text gives the date away
+    others = [c for c in others if not _date_leaks(c["text"], event_date)]
+
+    near = [c for c in others if _months_apart(c) <= 6]
+    if len(near) >= n_needed:
+        others = near
 
     # closest length first, then a little randomness so questions differ
     others.sort(key=lambda d: abs(len(d["text"].split()) - target_len))
@@ -199,9 +262,16 @@ def build_question(topic: Dict,
     rng = rng or random.Random()
     cands = topic.get("candidates", [])
 
-    correct = [c for c in cands if c.get("consensus", 0) >= 2]
-    weak = [c for c in cands if c.get("consensus", 0) == 1]
-    none_cands = [c for c in cands if c.get("consensus", 0) == 0]
+    # A candidate can have consensus None when every model failed to score
+    # it. Treat unscored as "not usable as a correct answer" but still fine
+    # as a distractor, rather than letting None reach a comparison.
+    def _score(c):
+        v = c.get("consensus")
+        return v if isinstance(v, int) else None
+
+    correct = [c for c in cands if _score(c) is not None and _score(c) >= 2]
+    weak = [c for c in cands if _score(c) == 1]
+    none_cands = [c for c in cands if _score(c) == 0 or _score(c) is None]
 
     if not correct:
         return None
@@ -209,7 +279,7 @@ def build_question(topic: Dict,
     # AER runs about 56% single, 30% double, 14% triple. Cap at 3 so at
     # least one distractor always remains.
     if len(correct) > 3:
-        correct = sorted(correct, key=lambda c: -c.get("consensus", 0))[:3]
+        correct = sorted(correct, key=lambda c: -(_score(c) or 0))[:3]
 
     target_entities = _content_words(topic.get("target_event", ""))
     local_pool = []
@@ -345,7 +415,7 @@ def verify_consistency(questions: List[Dict]) -> Dict:
     bad = []
     for q in questions:
         derived = {L for L, s in q["causal_strength"].items()
-                   if isinstance(s, int) and s >= 2}
+                   if isinstance(s, int) and s >= 2}   # None is excluded
         # the none option is correct despite carrying a score of 3 by design
         none_letters = {L for L, t in q.get("option_types", {}).items()
                         if t == "none_option"}
