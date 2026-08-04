@@ -19,7 +19,7 @@ Install only what you need:
     pip install openai anthropic google-generativeai
 """
 
-VERSION = "2026-08-04-c"
+VERSION = "2026-08-04-e"
 
 import os
 import time
@@ -41,12 +41,18 @@ MODELS = {
                  "name": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")},
     "cerebras": {"provider": "cerebras",
                  "name": os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b")},
+    # GitHub Models: free with any GitHub account, around 150 requests a day
+    # on the smaller models. Token from github.com/settings/tokens (a
+    # classic token with no scopes is enough).
+    "github":   {"provider": "github",
+                 "name": os.environ.get("GITHUB_MODEL", "gpt-4o-mini")},
 }
 
 # OpenAI-compatible endpoints, so one code path covers both
 OPENAI_COMPATIBLE = {
     "groq":     ("GROQ_API_KEY",     "https://api.groq.com/openai/v1"),
     "cerebras": ("CEREBRAS_API_KEY", "https://api.cerebras.ai/v1"),
+    "github":   ("GITHUB_TOKEN",     "https://models.inference.ai.azure.com"),
 }
 
 
@@ -84,7 +90,7 @@ def list_gemini_models() -> list:
 # The three used for scoring. Deliberately one from each family.
 # Preference order for scoring. available_models() filters this to whatever
 # keys are actually set, so it degrades gracefully from three models to one.
-SCORING_MODELS = ["gemini", "groq", "cerebras", "gpt", "claude"]
+SCORING_MODELS = ["gemini", "groq", "cerebras", "github", "gpt", "claude"]
 
 
 def scoring_models(n: int = 3) -> list:
@@ -96,17 +102,28 @@ _clients = {}
 
 # Free tiers cap requests per minute as well as per day. Spacing calls out
 # avoids burning retries on 429s that a short wait would have avoided.
-MIN_INTERVAL = float(os.environ.get("LLM_MIN_INTERVAL", "4.0"))
-_last_call = 0.0
+# Rate limits are per provider, so one shared timer is wrong: calling
+# gemini does not consume groq's budget. Groq allows 30 requests a minute
+# but bursts trip it, so these are deliberately conservative.
+PROVIDER_INTERVAL = {
+    "google":   float(os.environ.get("GEMINI_INTERVAL", "4.0")),
+    "groq":     float(os.environ.get("GROQ_INTERVAL", "3.0")),
+    "cerebras": float(os.environ.get("CEREBRAS_INTERVAL", "3.0")),
+    "github":   float(os.environ.get("GITHUB_INTERVAL", "5.0")),
+    "openai":   1.0,
+    "anthropic": 1.0,
+}
+_last_call = {}
 
 
-def _rate_wait():
-    global _last_call
+def _rate_wait(provider: str = "default"):
     import time as _t
-    elapsed = _t.time() - _last_call
-    if elapsed < MIN_INTERVAL:
-        _t.sleep(MIN_INTERVAL - elapsed)
-    _last_call = _t.time()
+    interval = PROVIDER_INTERVAL.get(provider, 4.0)
+    last = _last_call.get(provider, 0.0)
+    elapsed = _t.time() - last
+    if elapsed < interval:
+        _t.sleep(interval - elapsed)
+    _last_call[provider] = _t.time()
 
 
 def _get_client(provider: str):
@@ -163,7 +180,7 @@ def call_model(prompt: str,
     last_err = None
     for attempt in range(retries):
         try:
-            _rate_wait()
+            _rate_wait(provider)
             client = _get_client(provider)
 
             if provider in ("openai",) or provider in OPENAI_COMPATIBLE:
@@ -241,7 +258,12 @@ def call_model(prompt: str,
                     f"then llm.set_model('gemini', '<name>').\n"
                     f"Original error: {msg[:200]}")
             if attempt < retries - 1:
-                time.sleep(backoff * (2 ** attempt))
+                # 429 means wait, and waiting properly is cheaper than
+                # burning the remaining attempts
+                wait = backoff * (2 ** attempt)
+                if "429" in msg or "rate" in msg.lower():
+                    wait = max(wait, 20.0 * (attempt + 1))
+                time.sleep(wait)
 
     raise RuntimeError(f"{model} failed after {retries} attempts: {last_err}")
 
@@ -252,7 +274,8 @@ def available_models() -> list:
                "anthropic": "ANTHROPIC_API_KEY",
                "google": "GOOGLE_API_KEY",
                "groq": "GROQ_API_KEY",
-               "cerebras": "CEREBRAS_API_KEY"}
+               "cerebras": "CEREBRAS_API_KEY",
+               "github": "GITHUB_TOKEN"}
     return [k for k, spec in MODELS.items()
             if os.environ.get(env_for.get(spec["provider"], ""))]
 
