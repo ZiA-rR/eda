@@ -19,7 +19,7 @@ Install only what you need:
     pip install openai anthropic google-generativeai
 """
 
-VERSION = "2026-08-04-b"
+VERSION = "2026-08-04-c"
 
 import os
 import time
@@ -40,7 +40,7 @@ MODELS = {
     "groq":     {"provider": "groq",
                  "name": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")},
     "cerebras": {"provider": "cerebras",
-                 "name": os.environ.get("CEREBRAS_MODEL", "llama3.3-70b")},
+                 "name": os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b")},
 }
 
 # OpenAI-compatible endpoints, so one code path covers both
@@ -345,3 +345,66 @@ def check_models(models: list = None, verbose: bool = True) -> list:
             if verbose:
                 print(f"  {m:10s} {reason}")
     return working
+
+
+def list_provider_models(provider: str, verbose: bool = True) -> list:
+    """
+    Ask an OpenAI-compatible provider what models it actually serves.
+
+    Free-tier catalogues churn: Cerebras dropped from about a dozen models
+    to two in mid-2026, and Groq has removed models too. Hardcoding a name
+    means a silent failure the next time a provider prunes its list, so ask
+    rather than assume.
+
+    provider : "groq" or "cerebras"
+    """
+    if provider not in OPENAI_COMPATIBLE:
+        raise ValueError(f"{provider} is not an OpenAI-compatible provider")
+
+    client = _get_client(provider)
+    names = sorted(m.id for m in client.models.list().data)
+
+    if verbose:
+        print(f"{provider} serves {len(names)} models:")
+        for n in names:
+            print("  ", n)
+    return names
+
+
+def autoconfigure(verbose: bool = True) -> list:
+    """
+    Point every provider at a model it actually serves, and return the
+    model keys that work.
+
+    Run this once at the start of a session rather than debugging model
+    names one at a time.
+    """
+    # prefer general-purpose chat models over speech, guard and vision ones
+    PREFER = ["llama-3.3-70b", "llama3.3-70b", "gpt-oss-120b", "llama-4-scout",
+              "qwen3-32b", "llama-3.1-8b", "glm-4.7", "gpt-oss-20b"]
+    SKIP = ["whisper", "guard", "tts", "embed", "vision", "reranker"]
+
+    for provider in OPENAI_COMPATIBLE:
+        key_name = [k for k, v in MODELS.items() if v["provider"] == provider]
+        if not key_name:
+            continue
+        key = key_name[0]
+        env_var = OPENAI_COMPATIBLE[provider][0]
+        if not os.environ.get(env_var):
+            continue
+        try:
+            avail = list_provider_models(provider, verbose=False)
+            usable = [m for m in avail
+                      if not any(s in m.lower() for s in SKIP)]
+            pick = next((m for p in PREFER for m in usable if p in m.lower()),
+                        usable[0] if usable else None)
+            if pick:
+                MODELS[key]["name"] = pick
+                _clients.pop(provider, None)
+                if verbose:
+                    print(f"{key:10s} -> {pick}")
+        except Exception as e:
+            if verbose:
+                print(f"{key:10s} could not list models: {str(e)[:60]}")
+
+    return check_models(verbose=verbose)
