@@ -81,7 +81,8 @@ def _parse_json_list(raw: str) -> List[str]:
     try:
         parsed = json.loads(raw)
         if isinstance(parsed, list):
-            return [str(x).strip() for x in parsed if str(x).strip()]
+            return [x if isinstance(x, dict) else str(x).strip()
+                    for x in parsed if x]
     except json.JSONDecodeError:
         pass
 
@@ -91,7 +92,8 @@ def _parse_json_list(raw: str) -> List[str]:
         try:
             parsed = json.loads(m.group(0))
             if isinstance(parsed, list):
-                return [str(x).strip() for x in parsed if str(x).strip()]
+                return [x if isinstance(x, dict) else str(x).strip()
+                        for x in parsed if x]
         except json.JSONDecodeError:
             pass
 
@@ -295,6 +297,131 @@ def extract_candidates_for_topic(topic: Dict,
         n_before = sum(1 for e in timeline if e["position"] == "before")
         n_after = sum(1 for e in timeline if e["position"] == "after")
         print(f"  {len(all_events)} raw -> {len(filtered)} filtered -> "
+              f"{len(deduped)} unique  ({n_before} before, {n_after} after)")
+
+    return {**topic, "candidates": timeline}
+
+
+# ---------------------------------------------------------------- batched
+# One request per document burns quota fast: 41 topics at ~14 documents each
+# is around 574 calls, and the Gemini free tier allows 20 per day on some
+# models. Sending a whole topic in one request cuts that to 41.
+
+BATCH_PROMPT = """You are finding possible CAUSES of a specific market move.
+
+THE MOVE TO BE EXPLAINED:
+{target}
+
+Below are several news articles from around that time. Read all of them and
+list events that could help explain why the move happened.
+
+CRITICAL: do NOT list the price move itself, or any description of it.
+Exclude price readings, percentage changes, trading volume, technical
+analysis, other assets moving in parallel, and analyst forecasts. Those
+describe the effect, not the cause.
+
+DO list: central bank decisions, bank failures, bankruptcies, regulatory or
+legal actions, geopolitical events, supply disruptions, production
+decisions, large identifiable transactions, economic data releases, and
+public statements by governments, companies or major investors.
+
+Each event must be one self-contained sentence including the specific names,
+figures and dates given. Do not repeat the same event twice, even if several
+articles mention it.
+
+If the articles contain no such events, return an empty list. That is often
+the correct answer.
+
+ARTICLES:
+{articles}
+
+Return ONLY a JSON list of objects, no other text:
+[{{"event": "California regulators closed Silicon Valley Bank on 10 March.", "doc": 3}}]
+
+where "doc" is the number of the article the event came from.
+"""
+
+
+def extract_events_batched(topic: Dict,
+                           model: str = "gemini",
+                           max_chars_per_doc: int = 2500,
+                           max_total_chars: int = 60000,
+                           verbose: bool = True) -> List[Dict]:
+    """
+    Extract candidate causes from every document in one request.
+
+    Returns the same shape as the per-document version, so the rest of the
+    pipeline does not care which was used.
+    """
+    docs = [d for d in topic.get("docs", [])
+            if (d.get("content") or "").strip()]
+    if not docs:
+        return []
+
+    parts, used = [], 0
+    included = []
+    for i, d in enumerate(docs, 1):
+        body = (d.get("content") or "")[:max_chars_per_doc]
+        block = (f"--- ARTICLE {i} ---\n"
+                 f"source: {d.get('source','unknown')}\n"
+                 f"date: {d.get('date','unknown')}\n"
+                 f"{body}\n")
+        if used + len(block) > max_total_chars:
+            break
+        parts.append(block)
+        included.append((i, d))
+        used += len(block)
+
+    prompt = BATCH_PROMPT.format(
+        target=topic.get("target_event", "an unusually large price move"),
+        articles="\n".join(parts),
+    )
+
+    raw = call_model(prompt, model=model, max_tokens=3000)
+
+    # the batched prompt asks for objects, but models sometimes return a
+    # plain list of strings anyway
+    items = _parse_json_list(raw)
+    by_num = {i: d for i, d in included}
+
+    out = []
+    for item in items:
+        if isinstance(item, dict):
+            text = str(item.get("event", "")).strip()
+            src_doc = by_num.get(item.get("doc"), docs[0])
+        else:
+            text = str(item).strip()
+            src_doc = docs[0]
+        if not text:
+            continue
+        out.append({
+            "text": text,
+            "doc_id": src_doc.get("url", src_doc.get("id", "")),
+            "source": src_doc.get("source", ""),
+            "doc_date": src_doc.get("date", ""),
+            "doc_role": src_doc.get("role", "relevant"),
+        })
+
+    if verbose:
+        print(f"    1 request over {len(included)} documents -> {len(out)} events")
+    return out
+
+
+def extract_candidates_for_topic_batched(topic: Dict,
+                                         model: str = "gemini",
+                                         verbose: bool = True) -> Dict:
+    """
+    Stage 3 for one topic, using a single API request.
+    """
+    raw_events = extract_events_batched(topic, model=model, verbose=verbose)
+    filtered = filter_events(raw_events)
+    deduped = deduplicate_events(filtered)
+    timeline = build_timeline(deduped, topic["event_date"])
+
+    if verbose:
+        n_before = sum(1 for e in timeline if e["position"] == "before")
+        n_after = sum(1 for e in timeline if e["position"] == "after")
+        print(f"  {len(raw_events)} raw -> {len(filtered)} filtered -> "
               f"{len(deduped)} unique  ({n_before} before, {n_after} after)")
 
     return {**topic, "candidates": timeline}
