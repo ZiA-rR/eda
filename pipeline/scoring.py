@@ -394,3 +394,75 @@ def score_topic_batched(topic: Dict,
         print(f"  1 request for {len(to_score)} candidates. scores: {dict(sorted(dist.items(), key=lambda x: (x[0] is None, x[0])))}")
 
     return {**topic, "candidates": scored}
+
+
+def score_topic_batched_multi(topic: Dict,
+                              models: List[str] = None,
+                              max_candidates: int = 40,
+                              verbose: bool = True) -> Dict:
+    """
+    Batched scoring across several models, with disagreement routed to a
+    human.
+
+    This is the design the plan describes: score everything cheaply with
+    models, then spend human attention only where they disagree. Batching
+    keeps it to one request per model per topic, so three models over 41
+    topics is 123 requests rather than thousands.
+
+    Falls back to a single model if only one key is set.
+    """
+    from llm import scoring_models
+    models = models or scoring_models(3)
+    if not models:
+        raise RuntimeError("no model keys set")
+
+    context = build_context(topic)
+    target = topic.get("target_event") or topic.get("event_date")
+
+    cands = topic["candidates"][:max_candidates]
+    to_score, scored = [], []
+    for c in cands:
+        if c.get("position") == "after":
+            scored.append({**c, "consensus": 0, "spread": 0, "model_scores": {},
+                           "needs_review": False, "review_reason": "",
+                           "auto_zero": "dated after the target event"})
+        else:
+            to_score.append(c)
+
+    if not to_score:
+        return {**topic, "candidates": scored}
+
+    listing = "\n".join(f"{i}. {c['text']}" for i, c in enumerate(to_score, 1))
+    prompt = BATCH_SCORING_PROMPT.format(target=target, context=context,
+                                         candidates=listing)
+
+    per_model = {}
+    for m in models:
+        try:
+            raw = call_model(prompt, model=m, max_tokens=3000)
+            cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip(),
+                             flags=re.MULTILINE)
+            match = re.search(r"\[.*\]", cleaned, flags=re.DOTALL)
+            parsed = json.loads(match.group(0) if match else cleaned)
+            per_model[m] = {int(it["n"]): max(0, min(3, int(it.get("score", 0))))
+                            for it in parsed
+                            if isinstance(it, dict) and "n" in it}
+        except Exception as e:
+            if verbose:
+                print(f"    {m} failed: {type(e).__name__}: {str(e)[:70]}")
+
+    if not per_model:
+        raise RuntimeError("every model failed to score this topic")
+
+    for i, c in enumerate(to_score, 1):
+        scores = {m: d[i] for m, d in per_model.items() if i in d}
+        scored.append({**c, **_summarise(scores, {}, [])})
+
+    if verbose:
+        n_rev = sum(1 for c in scored if c.get("needs_review"))
+        dist = Counter(c.get("consensus") for c in scored)
+        print(f"  {len(models)} models x 1 request. "
+              f"scores {dict(sorted(dist.items(), key=lambda x: (x[0] is None, x[0])))}, "
+              f"{n_rev} need review")
+
+    return {**topic, "candidates": scored}
