@@ -239,14 +239,18 @@ def extract_text(url: str, timeout: int = 20, min_words: int = 120) -> Optional[
 # story bring in different reporting: the price move itself, the market
 # reaction, and the macro driver.
 BASE_QUERIES = {
-    "gold":   ["gold price", "gold market investors", "gold safe haven demand",
-               "precious metals gold silver"],
-    "crypto": ["bitcoin price", "bitcoin market selloff", "crypto market investors",
-               "cryptocurrency bitcoin trading"],
-    "petrol": ["oil prices", "crude oil market", "brent crude supply",
-               "oil market OPEC"],
-    "forex":  ["pound sterling dollar", "sterling currency markets",
-               "pound exchange rate", "sterling Bank of England"],
+    "gold":   ["gold price", "gold safe haven demand", "gold Federal Reserve",
+               "gold dollar yields", "gold investors central banks",
+               "precious metals market"],
+    "crypto": ["bitcoin price", "bitcoin selloff investors", "crypto regulation SEC",
+               "bitcoin institutional ETF", "crypto exchange market",
+               "cryptocurrency market news"],
+    "petrol": ["oil prices", "crude oil OPEC production", "oil supply disruption",
+               "oil inventories demand", "brent crude market",
+               "oil geopolitical supply"],
+    "forex":  ["pound sterling dollar", "sterling Bank of England",
+               "pound UK economy", "sterling gilt yields",
+               "pound government fiscal", "currency markets sterling"],
 }
 
 # Longer versions, used when falling back to GDELT.
@@ -367,7 +371,7 @@ def build_topic(asset: str,
 
     hits, seen_urls = [], set()
     for q in q_list:
-        got = search(q, date, max_records=30)
+        got = search(q, date, max_records=40)
         if not got:
             search_failures += 1
         for h in got:
@@ -497,7 +501,7 @@ def check_gdelt(verbose: bool = True) -> bool:
 
 SERPER_URL = "https://google.serper.dev/news"
 
-VERSION = "2026-08-03-h"   # bump when editing, check with retrieval.VERSION
+VERSION = "2026-08-04-a"   # bump when editing, check with retrieval.VERSION
 
 
 
