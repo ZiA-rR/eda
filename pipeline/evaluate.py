@@ -49,25 +49,70 @@ Return ONLY JSON, no other text:
 
 
 def _parse_answer(raw: str) -> List[str]:
-    raw = (raw or "").strip()
+    """
+    Pull the selected letters out of a model response.
+
+    Models vary a lot here: some return clean JSON, some wrap it in prose or
+    code fences, some answer "A and C" in plain English. Being strict about
+    the format means scoring a parsing failure as if the model got the
+    question wrong, which is worse than useless.
+    """
+    if not raw:
+        return []
+    raw = raw.strip()
     raw = re.sub(r"^```(?:json)?|```$", "", raw, flags=re.MULTILINE).strip()
 
+    def _clean(vals):
+        out = set()
+        for v in vals:
+            s = str(v).strip().strip('"\'').upper()
+            if s and s[0] in "ABCD":
+                out.add(s[0])
+        return sorted(out)
+
+    # 1. clean JSON
     try:
         obj = json.loads(raw)
         if isinstance(obj, dict) and "answer" in obj:
-            return sorted({str(x).strip().upper()[:1] for x in obj["answer"]
-                           if str(x).strip()[:1].upper() in "ABCD"})
+            a = obj["answer"]
+            return _clean(a if isinstance(a, list) else [a])
+        if isinstance(obj, list):
+            return _clean(obj)
     except (json.JSONDecodeError, TypeError):
         pass
 
+    # 2. a JSON object somewhere in the text
+    m = re.search(r'\{[^{}]*"answer"\s*:\s*(\[[^\]]*\]|"[A-D]")[^{}]*\}',
+                  raw, flags=re.DOTALL)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            a = obj["answer"]
+            return _clean(a if isinstance(a, list) else [a])
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # 3. just the answer array
     m = re.search(r'"answer"\s*:\s*\[(.*?)\]', raw, flags=re.DOTALL)
     if m:
-        return sorted({x.strip().strip('"\'').upper()[:1]
-                       for x in m.group(1).split(",")
-                       if x.strip().strip('"\'')[:1].upper() in "ABCD"})
+        return _clean(m.group(1).split(","))
 
-    found = re.findall(r"\b([ABCD])\b", raw.upper())
-    return sorted(set(found)) if found else []
+    # 4. prose: "the answer is A and C", "Options A, B"
+    m = re.search(r"(?:answer|correct|select)[^.\n]*?((?:\b[A-D]\b[,\s and&]*)+)",
+                  raw, flags=re.I)
+    if m:
+        letters = re.findall(r"\b([A-D])\b", m.group(1))
+        if letters:
+            return _clean(letters)
+
+    # 5. lines that start with a letter, as in "A. yes" or "- B"
+    letters = re.findall(r"^[\s\-\*]*([A-D])[.):\s]", raw, flags=re.MULTILINE)
+    if letters:
+        return _clean(letters)
+
+    # 6. last resort, any standalone A-D in the text
+    letters = re.findall(r"\b([A-D])\b", raw)
+    return _clean(letters) if letters else []
 
 
 # ------------------------------------------------------------- metrics
@@ -104,6 +149,7 @@ def evaluate_model(questions: List[Dict],
     of the task.
     """
     results = []
+    parse_failures = []
 
     for i, q in enumerate(questions, 1):
         topic = docs_by_topic.get(q["topic_id"], {})
@@ -128,6 +174,9 @@ def evaluate_model(questions: List[Dict],
         gold = [x for x in q["golden_answer"].split(",") if x]
         m = score_prediction(pred, gold)
 
+        if not pred and not raw.startswith("ERROR"):
+            parse_failures.append(raw[:200])
+
         results.append({
             "id": q.get("id", f"{q.get('asset')}_{q.get('event_date')}"),
             "asset": q.get("asset"),
@@ -139,7 +188,14 @@ def evaluate_model(questions: List[Dict],
         if verbose and i % 20 == 0:
             print(f"  {i}/{len(questions)}")
 
-    return {"model": model, "results": results, **aggregate(results)}
+    if parse_failures:
+        print(f"  WARNING: could not parse {len(parse_failures)} of "
+              f"{len(questions)} responses from {model}. "
+              f"A score of zero here means a parsing failure, not a wrong "
+              f"answer. First response was:\n    {parse_failures[0][:160]}")
+
+    return {"model": model, "results": results,
+            "parse_failures": len(parse_failures), **aggregate(results)}
 
 
 def aggregate(results: List[Dict]) -> Dict:
