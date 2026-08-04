@@ -154,10 +154,21 @@ def _summarise(scores: Dict[str, int], reasoning: Dict, failures: List) -> Dict:
     """
     vals = list(scores.values())
 
-    if len(vals) < 2:
+    if not vals:
         return {"model_scores": scores, "model_reasoning": reasoning,
                 "failures": failures, "consensus": None, "spread": None,
-                "needs_review": True, "review_reason": "too few model scores"}
+                "needs_review": True, "review_reason": "no model scored this"}
+
+    if len(vals) == 1:
+        # One usable score is far better than none. Discarding it because a
+        # second provider was rate limited throws away good labels and makes
+        # the whole topic unusable, which is worse than a slightly less
+        # certain label flagged for review.
+        only = vals[0]
+        return {"model_scores": scores, "model_reasoning": reasoning,
+                "failures": failures, "consensus": only, "spread": 0,
+                "mean": float(only), "needs_review": True,
+                "review_reason": "only one model scored this, no cross-check"}
 
     spread = max(vals) - min(vals)
     median = statistics.median(vals)
