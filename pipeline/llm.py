@@ -19,7 +19,7 @@ Install only what you need:
     pip install openai anthropic google-generativeai
 """
 
-VERSION = "2026-08-04-a"
+VERSION = "2026-08-04-b"
 
 import os
 import time
@@ -40,7 +40,7 @@ MODELS = {
     "groq":     {"provider": "groq",
                  "name": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")},
     "cerebras": {"provider": "cerebras",
-                 "name": os.environ.get("CEREBRAS_MODEL", "llama-3.3-70b")},
+                 "name": os.environ.get("CEREBRAS_MODEL", "llama3.3-70b")},
 }
 
 # OpenAI-compatible endpoints, so one code path covers both
@@ -310,3 +310,38 @@ def find_working_model(candidates: list = None, verbose: bool = True) -> str:
         "quota for today, or the key has no free-tier allocation. Options: "
         "wait for the daily reset, create the key under a new Google Cloud "
         "project, or enable billing.")
+
+
+def check_models(models: list = None, verbose: bool = True) -> list:
+    """
+    Try each model with a tiny prompt and return the ones that answer.
+
+    Worth running before a long job: a wrong model name otherwise fails on
+    every topic and burns retries each time.
+    """
+    models = models or available_models()
+    working = []
+    for m in models:
+        try:
+            out = call_model("Reply with the single word OK.", model=m,
+                             max_tokens=200, retries=1)
+            if out and out.strip():
+                working.append(m)
+                if verbose:
+                    print(f"  {m:10s} ok   ({MODELS[m]['name']})")
+                continue
+            if verbose:
+                print(f"  {m:10s} returned nothing")
+        except Exception as e:
+            msg = str(e)
+            if "model_not_found" in msg or "does not exist" in msg:
+                reason = f"model name wrong: {MODELS[m]['name']}"
+            elif "429" in msg or "quota" in msg.lower():
+                reason = "rate limited or out of quota"
+            elif "api_key" in msg.lower() or "401" in msg:
+                reason = "key missing or invalid"
+            else:
+                reason = msg[:60]
+            if verbose:
+                print(f"  {m:10s} {reason}")
+    return working
