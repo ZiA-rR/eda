@@ -167,8 +167,8 @@ def filter_events(events: List[Dict],
         "the surge", "the rally", "the selloff", "the plunge",
         "sudden rise", "sudden fall", "sharp rise", "sharp drop",
         "big revival", "enjoying the", "experienced a", "climbed to",
-        "plummeted", "skyrocketed", "cratered", "nosedived", "sank to",
-        "shed ", "wiped out", "erased", "pared", "rebounded to",
+        "plummeted", "skyrocketed", "cratered", "nosedived",
+        "wiped out", "erased", "pared",
         # trends rather than events: cannot explain a single day's move
         "over the past year", "over the last year", "in recent months",
         "has been rising", "has been falling", "steadily", "gradually",
@@ -177,6 +177,13 @@ def filter_events(events: List[Dict],
         "record high", "record low", "week high", "week low",
         "month high", "month low", "all-time high", "all-time low",
     ]
+
+    # A movement word is only disqualifying when it describes THIS asset.
+    # "The dollar weakened" and "yields rose" are genuine causes of a gold
+    # move, and an earlier version of this filter threw them away, leaving
+    # several gold topics with no candidates at all.
+    ASSET_SELF = ["bitcoin", "btc", "gold", "brent", "wti", "crude",
+                  "sterling", "the pound", "ether", "crypto"]
 
     kept = []
     for e in events:
@@ -188,7 +195,15 @@ def filter_events(events: List[Dict],
         if any(m in low for m in OPINION_MARKERS):
             continue
         if any(m in low for m in PRICE_DESCRIPTION):
-            continue
+            # only drop it if the sentence is about the asset itself
+            if any(a in low for a in ASSET_SELF):
+                continue
+            # otherwise it is probably a real driver: a currency, a yield,
+            # another market. Keep it and let scoring decide.
+            if any(m in low for m in ("moving average", "trading volume",
+                                      "order book", "was priced at",
+                                      "over the past year", "now make up")):
+                continue
         kept.append(e)
     return kept
 
