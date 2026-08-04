@@ -22,6 +22,48 @@ from typing import List, Dict, Optional
 from llm import call_model     # provider-agnostic wrapper, see llm.py
 
 
+
+# What actually drives each market. Without this the model looks for generic
+# "news events" and misses the specific mechanisms that move a given asset:
+# gold responds to real yields and the dollar, oil to supply and inventories,
+# and so on. Several gold topics returned zero candidates before this was
+# added, because the model did not recognise "the dollar weakened" or
+# "Treasury yields fell" as causal at all.
+ASSET_GUIDANCE = {
+    "gold": """For gold, the usual drivers are:
+- Federal Reserve decisions, minutes, or shifts in rate expectations
+- moves in the US dollar or in real Treasury yields
+- inflation data (CPI, PPI) and employment data
+- safe-haven demand from banking stress, war, or a sharp equity selloff
+- central bank buying or selling of reserves
+- ETF inflows and outflows""",
+
+    "crypto": """For bitcoin and crypto, the usual drivers are:
+- regulatory action, enforcement, court rulings, or ETF decisions
+- exchange failures, hacks, insolvencies, or large liquidations
+- statements or filings by large institutions entering or leaving
+- macro risk appetite, Fed policy, or a broad equity selloff
+- large identifiable on-chain transfers or whale activity
+- mining, halving, or protocol changes""",
+
+    "petrol": """For crude oil, the usual drivers are:
+- OPEC or OPEC+ production decisions and compliance
+- supply disruption: attacks, sanctions, outages, strikes, weather
+- inventory data (EIA, API) and changes in spare capacity
+- demand signals: economic data, lockdowns, travel, refinery runs
+- geopolitical events in producing regions
+- strategic reserve releases""",
+
+    "forex": """For currencies, the usual drivers are:
+- central bank rate decisions, guidance, or intervention
+- fiscal announcements, budgets, and debt issuance
+- political events: elections, resignations, referendums
+- economic data: inflation, growth, employment, trade
+- risk sentiment and safe-haven flows
+- rate differentials against other major currencies""",
+}
+
+
 EXTRACTION_PROMPT = """You are finding possible CAUSES of a specific market move.
 
 THE MOVE TO BE EXPLAINED:
@@ -346,6 +388,8 @@ legal actions, geopolitical events, supply disruptions, production
 decisions, large identifiable transactions, economic data releases, and
 public statements by governments, companies or major investors.
 
+{guidance}
+
 Each event must be one self-contained sentence including the specific names,
 figures and dates given. Do not repeat the same event twice, even if several
 articles mention it.
@@ -365,8 +409,8 @@ where "doc" is the number of the article the event came from.
 
 def extract_events_batched(topic: Dict,
                            model: str = "gemini",
-                           max_chars_per_doc: int = 2500,
-                           max_total_chars: int = 60000,
+                           max_chars_per_doc: int = 9000,
+                           max_total_chars: int = 250000,
                            verbose: bool = True) -> List[Dict]:
     """
     Extract candidate causes from every document in one request.
@@ -395,6 +439,7 @@ def extract_events_batched(topic: Dict,
 
     prompt = BATCH_PROMPT.format(
         target=topic.get("target_event", "an unusually large price move"),
+        guidance=ASSET_GUIDANCE.get(topic.get("asset", ""), ""),
         articles="\n".join(parts),
     )
 
@@ -444,5 +489,125 @@ def extract_candidates_for_topic_batched(topic: Dict,
         n_after = sum(1 for e in timeline if e["position"] == "after")
         print(f"  {len(raw_events)} raw -> {len(filtered)} filtered -> "
               f"{len(deduped)} unique  ({n_before} before, {n_after} after)")
+
+    return {**topic, "candidates": timeline}
+
+
+SECOND_PASS_PROMPT = """You already identified these possible causes of a
+market move, but the list looks incomplete.
+
+THE MOVE TO BE EXPLAINED:
+{target}
+
+{guidance}
+
+ALREADY FOUND:
+{found}
+
+ARTICLES:
+{articles}
+
+Read the articles again and list any ADDITIONAL events that could have
+contributed, which are not already in the list above. Look especially for
+background conditions and enabling factors, not just the obvious trigger:
+the state of inventories, positioning, prior policy, or existing stress that
+made the move larger than it would otherwise have been.
+
+Same rules as before: no price descriptions, no percentage moves, no
+technical analysis, no forecasts. Only things that happened.
+
+Return ONLY a JSON list of objects, no other text:
+[{{"event": "...", "doc": 3}}]
+
+Return an empty list if there is genuinely nothing to add.
+"""
+
+
+def second_pass(topic: Dict,
+                existing: List[Dict],
+                model: str = "gemini",
+                max_chars_per_doc: int = 9000,
+                max_total_chars: int = 250000,
+                verbose: bool = True) -> List[Dict]:
+    """
+    Ask again, showing what was already found.
+
+    Recall on the first pass is imperfect, and background conditions get
+    missed more often than triggers do. Those enabling factors are exactly
+    what the AILS-NTUA error analysis says models fail on, so they are worth
+    the extra request.
+    """
+    docs = [d for d in topic.get("docs", []) if (d.get("content") or "").strip()]
+    if not docs:
+        return []
+
+    parts, used, included = [], 0, []
+    for i, d in enumerate(docs, 1):
+        block = (f"--- ARTICLE {i} ---\n"
+                 f"source: {d.get('source','unknown')}\n"
+                 f"date: {d.get('date','unknown')}\n"
+                 f"{(d.get('content') or '')[:max_chars_per_doc]}\n")
+        if used + len(block) > max_total_chars:
+            break
+        parts.append(block); included.append((i, d)); used += len(block)
+
+    found = "\n".join(f"- {c['text']}" for c in existing) or "(nothing yet)"
+
+    prompt = SECOND_PASS_PROMPT.format(
+        target=topic.get("target_event", "a large price move"),
+        guidance=ASSET_GUIDANCE.get(topic.get("asset", ""), ""),
+        found=found,
+        articles="\n".join(parts))
+
+    raw = call_model(prompt, model=model, max_tokens=3000)
+    items = _parse_json_list(raw)
+    by_num = {i: d for i, d in included}
+
+    out = []
+    for item in items:
+        if isinstance(item, dict):
+            text = str(item.get("event", "")).strip()
+            src_doc = by_num.get(item.get("doc"), docs[0])
+        else:
+            text = str(item).strip(); src_doc = docs[0]
+        if text:
+            out.append({"text": text,
+                        "doc_id": src_doc.get("url", src_doc.get("id", "")),
+                        "source": src_doc.get("source", ""),
+                        "doc_date": src_doc.get("date", ""),
+                        "doc_role": src_doc.get("role", "relevant")})
+
+    if verbose and out:
+        print(f"    second pass added {len(out)} more")
+    return out
+
+
+def extract_thorough(topic: Dict,
+                     model: str = "gemini",
+                     min_candidates: int = 6,
+                     verbose: bool = True) -> Dict:
+    """
+    Extraction with a follow-up pass when the first comes back thin.
+
+    Costs one extra request only for the topics that need it, which is
+    where the yield problem actually is.
+    """
+    raw_events = extract_events_batched(topic, model=model, verbose=verbose)
+    filtered = filter_events(raw_events)
+    deduped = deduplicate_events(filtered)
+
+    if len(deduped) < min_candidates:
+        extra = second_pass(topic, deduped, model=model, verbose=verbose)
+        if extra:
+            deduped = deduplicate_events(
+                deduped + filter_events(extra))
+
+    timeline = build_timeline(deduped, topic["event_date"])
+
+    if verbose:
+        n_before = sum(1 for e in timeline if e["position"] == "before")
+        n_after = sum(1 for e in timeline if e["position"] == "after")
+        print(f"  {len(raw_events)} raw -> {len(timeline)} unique  "
+              f"({n_before} before, {n_after} after)")
 
     return {**topic, "candidates": timeline}
