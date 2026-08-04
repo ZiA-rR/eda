@@ -19,7 +19,7 @@ Install only what you need:
     pip install openai anthropic google-generativeai
 """
 
-VERSION = "2026-08-04-g"
+VERSION = "2026-08-04-h"
 
 import os
 import time
@@ -106,7 +106,7 @@ _clients = {}
 # but bursts trip it, so these are deliberately conservative.
 PROVIDER_INTERVAL = {
     "google":   float(os.environ.get("GEMINI_INTERVAL", "4.0")),
-    "groq":     float(os.environ.get("GROQ_INTERVAL", "3.0")),
+    "groq":     float(os.environ.get("GROQ_INTERVAL", "8.0")),
     "cerebras": float(os.environ.get("CEREBRAS_INTERVAL", "3.0")),
     "azure":    float(os.environ.get("AZURE_INTERVAL", "1.0")),
     "openai":   1.0,
