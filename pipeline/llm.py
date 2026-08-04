@@ -19,7 +19,7 @@ Install only what you need:
     pip install openai anthropic google-generativeai
 """
 
-VERSION = "2026-08-04-e"
+VERSION = "2026-08-04-f"
 
 import os
 import time
@@ -41,18 +41,17 @@ MODELS = {
                  "name": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")},
     "cerebras": {"provider": "cerebras",
                  "name": os.environ.get("CEREBRAS_MODEL", "gpt-oss-120b")},
-    # GitHub Models: free with any GitHub account, around 150 requests a day
-    # on the smaller models. Token from github.com/settings/tokens (a
-    # classic token with no scopes is enough).
-    "github":   {"provider": "github",
-                 "name": os.environ.get("GITHUB_MODEL", "gpt-4o-mini")},
+    # Azure OpenAI. GitHub Student Pack gives $100 of Azure credit and
+    # needs no card. Set AZURE_OPENAI_KEY and AZURE_OPENAI_ENDPOINT, where
+    # the endpoint looks like https://<resource>.openai.azure.com
+    "azure":    {"provider": "azure",
+                 "name": os.environ.get("AZURE_DEPLOYMENT", "gpt-4o-mini")},
 }
 
 # OpenAI-compatible endpoints, so one code path covers both
 OPENAI_COMPATIBLE = {
     "groq":     ("GROQ_API_KEY",     "https://api.groq.com/openai/v1"),
     "cerebras": ("CEREBRAS_API_KEY", "https://api.cerebras.ai/v1"),
-    "github":   ("GITHUB_TOKEN",     "https://models.inference.ai.azure.com"),
 }
 
 
@@ -90,7 +89,7 @@ def list_gemini_models() -> list:
 # The three used for scoring. Deliberately one from each family.
 # Preference order for scoring. available_models() filters this to whatever
 # keys are actually set, so it degrades gracefully from three models to one.
-SCORING_MODELS = ["gemini", "groq", "cerebras", "github", "gpt", "claude"]
+SCORING_MODELS = ["gemini", "groq", "cerebras", "azure", "gpt", "claude"]
 
 
 def scoring_models(n: int = 3) -> list:
@@ -109,7 +108,7 @@ PROVIDER_INTERVAL = {
     "google":   float(os.environ.get("GEMINI_INTERVAL", "4.0")),
     "groq":     float(os.environ.get("GROQ_INTERVAL", "3.0")),
     "cerebras": float(os.environ.get("CEREBRAS_INTERVAL", "3.0")),
-    "github":   float(os.environ.get("GITHUB_INTERVAL", "5.0")),
+    "azure":    float(os.environ.get("AZURE_INTERVAL", "1.0")),
     "openai":   1.0,
     "anthropic": 1.0,
 }
@@ -147,6 +146,13 @@ def _get_client(provider: str):
             import google.generativeai as old_genai
             old_genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
             _clients[provider] = ("old", old_genai)
+    elif provider == "azure":
+        from openai import AzureOpenAI
+        _clients[provider] = AzureOpenAI(
+            api_key=os.environ["AZURE_OPENAI_KEY"],
+            azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],
+            api_version=os.environ.get("AZURE_API_VERSION", "2024-10-21"))
+
     elif provider in OPENAI_COMPATIBLE:
         env_var, base_url = OPENAI_COMPATIBLE[provider]
         from openai import OpenAI
@@ -183,7 +189,7 @@ def call_model(prompt: str,
             _rate_wait(provider)
             client = _get_client(provider)
 
-            if provider in ("openai",) or provider in OPENAI_COMPATIBLE:
+            if provider in ("openai", "azure") or provider in OPENAI_COMPATIBLE:
                 resp = client.chat.completions.create(
                     model=name,
                     messages=[{"role": "user", "content": prompt}],
@@ -275,7 +281,7 @@ def available_models() -> list:
                "google": "GOOGLE_API_KEY",
                "groq": "GROQ_API_KEY",
                "cerebras": "CEREBRAS_API_KEY",
-               "github": "GITHUB_TOKEN"}
+               "azure": "AZURE_OPENAI_KEY"}
     return [k for k, spec in MODELS.items()
             if os.environ.get(env_for.get(spec["provider"], ""))]
 
