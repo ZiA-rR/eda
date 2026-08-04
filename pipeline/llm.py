@@ -19,7 +19,7 @@ Install only what you need:
     pip install openai anthropic google-generativeai
 """
 
-VERSION = "2026-08-03-c"
+VERSION = "2026-08-03-d"
 
 import os
 import time
@@ -73,6 +73,20 @@ SCORING_MODELS = ["gpt", "claude", "gemini"]
 
 _clients = {}
 
+# Free tiers cap requests per minute as well as per day. Spacing calls out
+# avoids burning retries on 429s that a short wait would have avoided.
+MIN_INTERVAL = float(os.environ.get("LLM_MIN_INTERVAL", "4.0"))
+_last_call = 0.0
+
+
+def _rate_wait():
+    global _last_call
+    import time as _t
+    elapsed = _t.time() - _last_call
+    if elapsed < MIN_INTERVAL:
+        _t.sleep(MIN_INTERVAL - elapsed)
+    _last_call = _t.time()
+
 
 def _get_client(provider: str):
     if provider in _clients:
@@ -123,6 +137,7 @@ def call_model(prompt: str,
     last_err = None
     for attempt in range(retries):
         try:
+            _rate_wait()
             client = _get_client(provider)
 
             if provider == "openai":
@@ -184,6 +199,13 @@ def call_model(prompt: str,
         except Exception as e:
             last_err = e
             msg = str(e)
+            if "PerDay" in msg or "RequestsPerDayPerProject" in msg:
+                raise RuntimeError(
+                    f"{model} ({name}) hit its DAILY free-tier limit.\n"
+                    f"Options: switch model with "
+                    f"llm.set_model('gemini', 'gemini-2.5-flash-lite'), "
+                    f"wait until the quota resets, or enable billing.\n"
+                    f"Original: {msg[:200]}")
             if "limit: 0" in msg:
                 # no free-tier allocation for this model at all, so retrying
                 # will never help
