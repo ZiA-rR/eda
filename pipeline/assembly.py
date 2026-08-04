@@ -249,6 +249,8 @@ def build_question(topic: Dict,
                    n_options: int = 4,
                    max_length_gap: float = 4.0,
                    none_option_prob: float = 0.15,
+                   allow_none_answer: bool = False,
+                   none_answer_prob: float = 0.05,
                    pool: Dict[str, List[Dict]] = None,
                    rng: random.Random = None) -> Optional[Dict]:
     """
@@ -296,13 +298,17 @@ def build_question(topic: Dict,
         local_pool += _cross_topic_distractors(
             topic, pool, n_needed - len(local_pool), target_len, rng)
 
-    # a none-option question: all four options wrong except the none itself
-    use_none_as_answer = rng.random() < none_option_prob and len(local_pool) >= 3
+    # "None of the others" as the ANSWER produces a question with no causal
+    # content: every real option is a non-cause, so there is nothing to
+    # reason about. AER did this and it became exploitable, since none was
+    # correct every time it appeared. Off by default; the option still gets
+    # used as a distractor below, which is what removes the shortcut.
+    use_none_as_answer = (allow_none_answer
+                          and rng.random() < none_answer_prob
+                          and len(local_pool) >= 3)
 
     if use_none_as_answer:
-        chosen = local_pool[:3] if len(local_pool) >= 3 else None
-        if not chosen:
-            return None
+        chosen = local_pool[:3]
         entries = [{"text": d["text"], "correct": False,
                     "score": d.get("consensus", 0),
                     "type": d.get("distractor_type")} for d in chosen]
@@ -366,6 +372,31 @@ def build_question(topic: Dict,
     return q
 
 
+def _rotate(q: Dict, shift: int) -> Dict:
+    """Rotate a question's options by a fixed offset."""
+    letters = ["A", "B", "C", "D"]
+    perm = {letters[i]: letters[(i + shift) % 4] for i in range(4)}
+
+    opts = {L: q[f"option_{L}"] for L in letters}
+    gold = set(q["golden_answer"].split(",")) - {""}
+
+    new_opts, new_str, new_types, new_gold = {}, {}, {}, []
+    for old in letters:
+        new = perm[old]
+        new_opts[new] = opts[old]
+        new_str[new] = q["causal_strength"][old]
+        new_types[new] = q["option_types"][old]
+        if old in gold:
+            new_gold.append(new)
+
+    for L in letters:
+        q[f"option_{L}"] = new_opts[L]
+    q["causal_strength"] = new_str
+    q["option_types"] = new_types
+    q["golden_answer"] = ",".join(sorted(new_gold))
+    return q
+
+
 def rebalance_positions(questions: List[Dict], rng: random.Random = None) -> List[Dict]:
     """
     Make sure correct answers are spread evenly across A, B, C and D.
@@ -375,6 +406,37 @@ def rebalance_positions(questions: List[Dict], rng: random.Random = None) -> Lis
     exactly the kind of pattern a model can learn instead of reasoning, so
     this pass exists to catch it.
     """
+    rng = rng or random.Random()
+    letters = ["A", "B", "C", "D"]
+
+    # A random shuffle per question leaves the totals uneven at small sample
+    # sizes: 20 questions came out A9 B6 C10 D12. Instead, pick the rotation
+    # that moves each question's correct answers to whichever letters are
+    # currently least used.
+    counts = {L: 0 for L in letters}
+    order = sorted(questions, key=lambda q: -len(q["golden_answer"].split(",")))
+
+    for q in order:
+        gold = [L for L in q["golden_answer"].split(",") if L]
+        best_shift, best_cost = 0, None
+        for shift in range(4):
+            moved = [letters[(letters.index(g) + shift) % 4] for g in gold]
+            cost = sum(counts[m] for m in moved)
+            # tiny tiebreak so identical costs do not always pick shift 0
+            cost += rng.random() * 0.01
+            if best_cost is None or cost < best_cost:
+                best_cost, best_shift = cost, shift
+
+        _rotate(q, best_shift)
+        for L in q["golden_answer"].split(","):
+            if L:
+                counts[L] += 1
+
+    return questions
+
+
+def _rebalance_random(questions: List[Dict], rng: random.Random = None) -> List[Dict]:
+    """The old per-question shuffle, kept for comparison."""
     rng = rng or random.Random()
     letters = ["A", "B", "C", "D"]
 
