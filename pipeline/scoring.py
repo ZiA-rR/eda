@@ -301,3 +301,96 @@ def review_queue(scored_topics: List[Dict]) -> List[Dict]:
                 })
     queue.sort(key=lambda x: -(x["spread"] or 0))
     return queue
+
+
+# ---------------------------------------------------------------- batched
+BATCH_SCORING_PROMPT = """You are assessing how strongly each candidate event
+caused a specific market move.
+
+TARGET EVENT (the thing to be explained):
+{target}
+
+CONTEXT (news reporting from around that time):
+{context}
+
+CANDIDATE CAUSES:
+{candidates}
+
+Rate each candidate:
+
+3 = STRONG. A main driver. The target event would probably not have happened
+    as it did without this.
+2 = MODERATE. A real contributing cause alongside others, but not the main one.
+1 = WEAK. Background or minor. Too far removed to call it a cause of this
+    specific move.
+0 = NONE. Not a cause. This includes anything that happened AFTER the target
+    event, and anything merely topically related.
+
+Return ONLY a JSON list, one object per candidate, in the same order:
+[{{"n": 1, "score": 3, "why": "brief"}}, {{"n": 2, "score": 0, "why": "brief"}}]
+"""
+
+
+def score_topic_batched(topic: Dict,
+                        model: str = "gemini",
+                        max_candidates: int = 40,
+                        verbose: bool = True) -> Dict:
+    """
+    Score every candidate for a topic in one request rather than one each.
+
+    Uses a single model, so there is no cross-model disagreement signal and
+    nothing gets routed to human review. That is the trade for fitting
+    inside a free tier. With three keys set, use score_topic instead.
+    """
+    context = build_context(topic)
+    target = topic.get("target_event") or topic.get("event_date")
+
+    cands = topic["candidates"][:max_candidates]
+    to_score, scored = [], []
+
+    for c in cands:
+        if c.get("position") == "after":
+            scored.append({**c, "consensus": 0, "spread": 0, "model_scores": {},
+                           "needs_review": False, "review_reason": "",
+                           "auto_zero": "dated after the target event"})
+        else:
+            to_score.append(c)
+
+    if not to_score:
+        return {**topic, "candidates": scored}
+
+    listing = "\n".join(f"{i}. {c['text']}" for i, c in enumerate(to_score, 1))
+    prompt = BATCH_SCORING_PROMPT.format(target=target, context=context,
+                                         candidates=listing)
+
+    raw = call_model(prompt, model=model, max_tokens=3000)
+
+    by_n = {}
+    try:
+        cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE)
+        m = re.search(r"\[.*\]", cleaned, flags=re.DOTALL)
+        for item in json.loads(m.group(0) if m else cleaned):
+            if isinstance(item, dict) and "n" in item:
+                by_n[int(item["n"])] = item
+    except Exception as e:
+        if verbose:
+            print(f"    could not parse scores: {e}")
+
+    for i, c in enumerate(to_score, 1):
+        item = by_n.get(i)
+        if item is None:
+            scored.append({**c, "consensus": None, "spread": None,
+                           "model_scores": {}, "needs_review": True,
+                           "review_reason": "no score returned"})
+            continue
+        sc = max(0, min(3, int(item.get("score", 0))))
+        scored.append({**c, "consensus": sc, "spread": 0,
+                       "model_scores": {model: sc},
+                       "model_reasoning": {model: str(item.get("why", ""))},
+                       "needs_review": False, "review_reason": ""})
+
+    if verbose:
+        dist = Counter(c.get("consensus") for c in scored)
+        print(f"  1 request for {len(to_score)} candidates. scores: {dict(sorted(dist.items(), key=lambda x: (x[0] is None, x[0])))}")
+
+    return {**topic, "candidates": scored}
