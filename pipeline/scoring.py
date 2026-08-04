@@ -451,10 +451,25 @@ def score_topic_batched_multi(topic: Dict,
             cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip(),
                              flags=re.MULTILINE)
             match = re.search(r"\[.*\]", cleaned, flags=re.DOTALL)
-            parsed = json.loads(match.group(0) if match else cleaned)
-            per_model[m] = {int(it["n"]): max(0, min(3, int(it.get("score", 0))))
-                            for it in parsed
-                            if isinstance(it, dict) and "n" in it}
+            try:
+                parsed = json.loads(match.group(0) if match else cleaned)
+            except json.JSONDecodeError:
+                # models sometimes truncate or emit trailing junk. Salvage
+                # the individual objects rather than losing the topic.
+                parsed = []
+                for obj in re.findall(r"\{[^{}]*\}", cleaned):
+                    try:
+                        parsed.append(json.loads(obj))
+                    except json.JSONDecodeError:
+                        continue
+            got = {int(it["n"]): max(0, min(3, int(it.get("score", 0))))
+                   for it in parsed
+                   if isinstance(it, dict) and "n" in it
+                   and str(it.get("score", "")).strip() != ""}
+            if got:
+                per_model[m] = got
+            elif verbose:
+                print(f"    {m} returned nothing parseable")
         except Exception as e:
             msg = str(e)
             # a wrong model name will fail on every topic, so stop trying it
@@ -480,3 +495,71 @@ def score_topic_batched_multi(topic: Dict,
               f"{n_rev} need review")
 
     return {**topic, "candidates": scored}
+
+
+def rescore_unscored(scored_topics: List[Dict],
+                     models: List[str] = None,
+                     verbose: bool = True) -> List[Dict]:
+    """
+    Second pass over candidates that came back unscored.
+
+    Transient failures leave consensus as None, and those candidates cannot
+    be used as correct answers. Retrying only the affected topics is much
+    cheaper than rerunning everything.
+    """
+    from llm import scoring_models
+    models = models or scoring_models(3)
+
+    needs = [t for t in scored_topics
+             if any(c.get("consensus") is None for c in t["candidates"])]
+
+    if verbose:
+        n_cand = sum(1 for t in needs for c in t["candidates"]
+                     if c.get("consensus") is None)
+        print(f"{len(needs)} topics have {n_cand} unscored candidates\n")
+
+    by_key = {f"{t['asset']}_{t['event_date']}": t for t in scored_topics}
+
+    for i, t in enumerate(needs, 1):
+        key = f"{t['asset']}_{t['event_date']}"
+        if verbose:
+            print(f"[{i}/{len(needs)}] {key}")
+        try:
+            # strip previous results so the topic is scored fresh
+            clean = {**t, "candidates": [
+                {k: v for k, v in c.items()
+                 if k not in ("consensus", "spread", "model_scores",
+                              "needs_review", "review_reason", "mean")}
+                for c in t["candidates"]]}
+            by_key[key] = score_topic_batched_multi(clean, models=models,
+                                                    verbose=verbose)
+        except Exception as e:
+            if verbose:
+                print(f"    still failing: {type(e).__name__}: {str(e)[:70]}")
+
+    return [by_key[f"{t['asset']}_{t['event_date']}"] for t in scored_topics]
+
+
+def score_report(scored_topics: List[Dict]) -> Dict:
+    """Where the dataset actually stands after scoring."""
+    cands = [c for t in scored_topics for c in t["candidates"]]
+    dist = Counter(c.get("consensus") for c in cands)
+
+    per_topic_correct = [
+        sum(1 for c in t["candidates"]
+            if isinstance(c.get("consensus"), int) and c["consensus"] >= 2)
+        for t in scored_topics]
+    per_topic_total = [len(t["candidates"]) for t in scored_topics]
+
+    return {
+        "topics": len(scored_topics),
+        "candidates": len(cands),
+        "score_distribution": dict(sorted(dist.items(),
+                                          key=lambda x: (x[0] is None, x[0]))),
+        "unscored": dist.get(None, 0),
+        "needing_review": sum(1 for c in cands if c.get("needs_review")),
+        "topics_with_no_correct_answer": sum(1 for n in per_topic_correct if n == 0),
+        "topics_with_under_4_candidates": sum(1 for n in per_topic_total if n < 4),
+        "usable_topics": sum(1 for nc, nt in zip(per_topic_correct, per_topic_total)
+                             if nc >= 1 and nt >= 2),
+    }
