@@ -115,11 +115,78 @@ def _pick_balanced(correct: List[Dict], distractors: List[Dict],
     return chosen
 
 
+
+# --------------------------------------------------- cross-topic pool
+def build_distractor_pool(topics: List[Dict]) -> Dict[str, List[Dict]]:
+    """
+    Collect candidates per asset so a question can draw distractors from
+    other events of the same asset.
+
+    A real cause of a different gold move is topically convincing but is
+    definitively not a cause of this one. That is AER's semantic distractor
+    category, and it costs nothing.
+
+    Without this, extraction has to supply all four options for every
+    question, and roughly half of topics do not yield enough.
+    """
+    pool: Dict[str, List[Dict]] = {}
+    for t in topics:
+        asset = t.get("asset", "unknown")
+        for c in t.get("candidates", []):
+            pool.setdefault(asset, []).append({
+                **c,
+                "from_topic": f"{asset}_{t.get('event_date')}",
+                "from_date": t.get("event_date"),
+            })
+    return pool
+
+
+def _cross_topic_distractors(topic: Dict,
+                             pool: Dict[str, List[Dict]],
+                             n_needed: int,
+                             target_len: float,
+                             rng: random.Random) -> List[Dict]:
+    """
+    Pick candidates from other events of the same asset, preferring ones
+    whose length is close to the correct options so the length gap stays
+    small.
+    """
+    asset = topic.get("asset", "unknown")
+    this_topic = f"{asset}_{topic.get('event_date')}"
+
+    others = [c for c in pool.get(asset, [])
+              if c.get("from_topic") != this_topic]
+    if not others:
+        return []
+
+    # never reuse text that already appears in this topic
+    own = {c["text"].strip().lower() for c in topic.get("candidates", [])}
+    others = [c for c in others if c["text"].strip().lower() not in own]
+
+    # closest length first, then a little randomness so questions differ
+    others.sort(key=lambda d: abs(len(d["text"].split()) - target_len))
+    shortlist = others[:max(n_needed * 4, 12)]
+    rng.shuffle(shortlist)
+
+    out = []
+    seen = set()
+    for d in shortlist:
+        key = d["text"].strip().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({**d, "consensus": 0, "distractor_type": "semantic_crosstopic"})
+        if len(out) >= n_needed:
+            break
+    return out
+
+
 # ------------------------------------------------------------- assembly
 def build_question(topic: Dict,
                    n_options: int = 4,
                    max_length_gap: float = 4.0,
                    none_option_prob: float = 0.15,
+                   pool: Dict[str, List[Dict]] = None,
                    rng: random.Random = None) -> Optional[Dict]:
     """
     Build one question from a scored topic.
@@ -145,17 +212,25 @@ def build_question(topic: Dict,
         correct = sorted(correct, key=lambda c: -c.get("consensus", 0))[:3]
 
     target_entities = _content_words(topic.get("target_event", ""))
-    pool = []
+    local_pool = []
     for c in weak + none_cands:
         c = dict(c)
         c["distractor_type"] = classify_distractor(c, target_entities)
-        pool.append(c)
+        local_pool.append(c)
+
+    # top up from other events of the same asset when this topic did not
+    # yield enough of its own
+    n_needed = n_options - len(correct)
+    if pool and len(local_pool) < n_needed:
+        target_len = statistics.mean(len(c["text"].split()) for c in correct)
+        local_pool += _cross_topic_distractors(
+            topic, pool, n_needed - len(local_pool), target_len, rng)
 
     # a none-option question: all four options wrong except the none itself
-    use_none_as_answer = rng.random() < none_option_prob and len(pool) >= 3
+    use_none_as_answer = rng.random() < none_option_prob and len(local_pool) >= 3
 
     if use_none_as_answer:
-        chosen = pool[:3] if len(pool) >= 3 else None
+        chosen = local_pool[:3] if len(local_pool) >= 3 else None
         if not chosen:
             return None
         entries = [{"text": d["text"], "correct": False,
@@ -164,7 +239,7 @@ def build_question(topic: Dict,
         entries.append({"text": NONE_TEXT, "correct": True, "score": 3,
                         "type": "none_option"})
     else:
-        chosen = _pick_balanced(correct, pool, n_options, max_length_gap)
+        chosen = _pick_balanced(correct, local_pool, n_options, max_length_gap)
         if chosen is None:
             return None
         entries = [{"text": c["text"], "correct": True,
