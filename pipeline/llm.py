@@ -19,7 +19,7 @@ Install only what you need:
     pip install openai anthropic google-generativeai
 """
 
-VERSION = "2026-08-03-d"
+VERSION = "2026-08-03-e"
 
 import os
 import time
@@ -33,7 +33,7 @@ MODELS = {
     "gpt":    {"provider": "openai",    "name": "gpt-4o"},
     "claude": {"provider": "anthropic", "name": "claude-sonnet-4-5"},
     "gemini": {"provider": "google",
-               "name": os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")},
+               "name": os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest")},
 }
 
 
@@ -230,3 +230,58 @@ def available_models() -> list:
         if os.environ.get(env):
             have.append(key)
     return have
+
+
+# Model availability shifts: names get deprecated for new users, free-tier
+# quotas move. Rather than guessing, try candidates until one answers.
+GEMINI_CANDIDATES = [
+    "gemini-flash-lite-latest",   # alias, tracks whatever is current
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-flash-latest",
+    "gemini-3.5-flash",
+    "gemini-3.6-flash",
+    "gemini-2.5-flash",
+]
+
+
+def find_working_model(candidates: list = None, verbose: bool = True) -> str:
+    """
+    Try each candidate with a tiny prompt and return the first that works.
+
+    Sets it as the active gemini model. Costs one request per candidate
+    tried, and stops at the first success.
+    """
+    candidates = candidates or GEMINI_CANDIDATES
+    original = MODELS["gemini"]["name"]
+
+    for name in candidates:
+        MODELS["gemini"]["name"] = name
+        _clients.pop("google", None)
+        try:
+            out = call_model("Reply with the single word OK.",
+                             model="gemini", max_tokens=200, retries=1)
+            if out and out.strip():
+                if verbose:
+                    print(f"working: {name}")
+                return name
+        except Exception as e:
+            msg = str(e)
+            if "NOT_FOUND" in msg or "no longer available" in msg:
+                reason = "not available"
+            elif "PerDay" in msg or "limit: 0" in msg:
+                reason = "quota exhausted"
+            elif "429" in msg:
+                reason = "rate limited"
+            else:
+                reason = msg[:60]
+            if verbose:
+                print(f"  {name:26s} {reason}")
+
+    MODELS["gemini"]["name"] = original
+    _clients.pop("google", None)
+    raise RuntimeError(
+        "no working gemini model found. Either every candidate is out of "
+        "quota for today, or the key has no free-tier allocation. Options: "
+        "wait for the daily reset, create the key under a new Google Cloud "
+        "project, or enable billing.")
