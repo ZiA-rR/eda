@@ -26,6 +26,7 @@ buckets than on an exact number, which is what sank CRAB's agreement.
 import json
 import re
 import statistics
+from collections import Counter
 from typing import List, Dict, Optional
 
 from llm import call_model, SCORING_MODELS
@@ -396,6 +397,11 @@ def score_topic_batched(topic: Dict,
     return {**topic, "candidates": scored}
 
 
+# providers that have already failed with a bad model name, so we stop
+# paying the retry cost on every remaining topic
+_DEAD_MODELS = set()
+
+
 def score_topic_batched_multi(topic: Dict,
                               models: List[str] = None,
                               max_candidates: int = 40,
@@ -438,6 +444,8 @@ def score_topic_batched_multi(topic: Dict,
 
     per_model = {}
     for m in models:
+        if m in _DEAD_MODELS:
+            continue
         try:
             raw = call_model(prompt, model=m, max_tokens=3000)
             cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip(),
@@ -448,8 +456,14 @@ def score_topic_batched_multi(topic: Dict,
                             for it in parsed
                             if isinstance(it, dict) and "n" in it}
         except Exception as e:
-            if verbose:
-                print(f"    {m} failed: {type(e).__name__}: {str(e)[:70]}")
+            msg = str(e)
+            # a wrong model name will fail on every topic, so stop trying it
+            if "model_not_found" in msg or "does not exist" in msg or "404" in msg:
+                _DEAD_MODELS.add(m)
+                print(f"    {m} unavailable, dropping it for this run "
+                      f"(check the model name)")
+            elif verbose:
+                print(f"    {m} failed: {type(e).__name__}: {msg[:70]}")
 
     if not per_model:
         raise RuntimeError("every model failed to score this topic")
