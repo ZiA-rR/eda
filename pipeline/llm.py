@@ -19,7 +19,7 @@ Install only what you need:
     pip install openai anthropic google-generativeai
 """
 
-VERSION = "2026-08-04-f"
+VERSION = "2026-08-04-g"
 
 import os
 import time
@@ -113,6 +113,10 @@ PROVIDER_INTERVAL = {
     "anthropic": 1.0,
 }
 _last_call = {}
+
+# models that reject thinking_budget, learned at runtime so we only pay the
+# failed request once per session
+_NO_THINKING_UNSUPPORTED = set()
 
 
 def _rate_wait(provider: str = "default"):
@@ -210,18 +214,35 @@ def call_model(prompt: str,
             if provider == "google":
                 kind, gclient = client
                 if kind == "new":
-                    cfg = {"max_output_tokens": max_tokens,
-                           "temperature": temperature}
+                    base_cfg = {"max_output_tokens": max_tokens,
+                                "temperature": temperature}
                     # Gemini 2.5 and later spend output tokens on internal
-                    # reasoning before answering. For structured extraction
-                    # and scoring we want the answer, not the reasoning, and
-                    # leaving thinking on means the budget gets eaten and
-                    # .text comes back empty.
-                    if any(v in name for v in ("2.5", "3.", "-latest")):
+                    # reasoning before answering, which can consume the whole
+                    # budget and leave .text empty. Turning thinking off fixes
+                    # that, but not every model accepts the setting, and the
+                    # ones that reject it return a bare 400 INVALID_ARGUMENT.
+                    # So try it, and drop it if the model objects rather than
+                    # trying to track which versions support what.
+                    wants_no_thinking = (
+                        name not in _NO_THINKING_UNSUPPORTED
+                        and any(v in name for v in ("2.5", "3.", "-latest")))
+
+                    cfg = dict(base_cfg)
+                    if wants_no_thinking:
                         cfg["thinking_config"] = {"thinking_budget": 0}
 
-                    resp = gclient.models.generate_content(
-                        model=name, contents=prompt, config=cfg)
+                    try:
+                        resp = gclient.models.generate_content(
+                            model=name, contents=prompt, config=cfg)
+                    except Exception as cfg_err:
+                        if wants_no_thinking and "INVALID_ARGUMENT" in str(cfg_err):
+                            _NO_THINKING_UNSUPPORTED.add(name)
+                            print(f"  {name} rejects thinking_budget, "
+                                  f"retrying without it")
+                            resp = gclient.models.generate_content(
+                                model=name, contents=prompt, config=base_cfg)
+                        else:
+                            raise
 
                     text = getattr(resp, "text", None)
                     if text:
