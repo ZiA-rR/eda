@@ -19,7 +19,7 @@ Install only what you need:
     pip install openai anthropic google-generativeai
 """
 
-VERSION = "2026-08-03-e"
+VERSION = "2026-08-04-a"
 
 import os
 import time
@@ -34,6 +34,19 @@ MODELS = {
     "claude": {"provider": "anthropic", "name": "claude-sonnet-4-5"},
     "gemini": {"provider": "google",
                "name": os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest")},
+    # Free tiers with no card required. Groq allows around 1,000 requests a
+    # day, Cerebras around 1M tokens a day. Different model families, which
+    # is what makes their disagreement meaningful.
+    "groq":     {"provider": "groq",
+                 "name": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")},
+    "cerebras": {"provider": "cerebras",
+                 "name": os.environ.get("CEREBRAS_MODEL", "llama-3.3-70b")},
+}
+
+# OpenAI-compatible endpoints, so one code path covers both
+OPENAI_COMPATIBLE = {
+    "groq":     ("GROQ_API_KEY",     "https://api.groq.com/openai/v1"),
+    "cerebras": ("CEREBRAS_API_KEY", "https://api.cerebras.ai/v1"),
 }
 
 
@@ -69,7 +82,15 @@ def list_gemini_models() -> list:
     return names
 
 # The three used for scoring. Deliberately one from each family.
-SCORING_MODELS = ["gpt", "claude", "gemini"]
+# Preference order for scoring. available_models() filters this to whatever
+# keys are actually set, so it degrades gracefully from three models to one.
+SCORING_MODELS = ["gemini", "groq", "cerebras", "gpt", "claude"]
+
+
+def scoring_models(n: int = 3) -> list:
+    """Up to n different model families that we have keys for."""
+    have = [m for m in SCORING_MODELS if m in available_models()]
+    return have[:n]
 
 _clients = {}
 
@@ -109,6 +130,11 @@ def _get_client(provider: str):
             import google.generativeai as old_genai
             old_genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
             _clients[provider] = ("old", old_genai)
+    elif provider in OPENAI_COMPATIBLE:
+        env_var, base_url = OPENAI_COMPATIBLE[provider]
+        from openai import OpenAI
+        _clients[provider] = OpenAI(api_key=os.environ[env_var],
+                                    base_url=base_url)
     else:
         raise ValueError(f"unknown provider {provider}")
 
@@ -140,7 +166,7 @@ def call_model(prompt: str,
             _rate_wait()
             client = _get_client(provider)
 
-            if provider == "openai":
+            if provider in ("openai",) or provider in OPENAI_COMPATIBLE:
                 resp = client.chat.completions.create(
                     model=name,
                     messages=[{"role": "user", "content": prompt}],
@@ -222,14 +248,13 @@ def call_model(prompt: str,
 
 def available_models() -> list:
     """Which models we actually have keys for."""
-    have = []
-    for key, spec in MODELS.items():
-        env = {"openai": "OPENAI_API_KEY",
+    env_for = {"openai": "OPENAI_API_KEY",
                "anthropic": "ANTHROPIC_API_KEY",
-               "google": "GOOGLE_API_KEY"}[spec["provider"]]
-        if os.environ.get(env):
-            have.append(key)
-    return have
+               "google": "GOOGLE_API_KEY",
+               "groq": "GROQ_API_KEY",
+               "cerebras": "CEREBRAS_API_KEY"}
+    return [k for k, spec in MODELS.items()
+            if os.environ.get(env_for.get(spec["provider"], ""))]
 
 
 # Model availability shifts: names get deprecated for new users, free-tier
