@@ -250,43 +250,124 @@ def filter_events(events: List[Dict],
     return kept
 
 
-def deduplicate_events(events: List[Dict], threshold: float = 0.75) -> List[Dict]:
+STOPWORDS = {
+    "the","a","an","of","to","in","on","and","for","by","at","as","its","it",
+    "was","were","is","are","that","this","with","from","after","before",
+    "has","had","have","been","be","which","their","said","announced","would",
+    "will","its","over","into","about","more","than","all","up","down",
+}
+
+
+def _content_tokens(text: str) -> set:
+    return {w for w in re.findall(r"\w+", text.lower())
+            if w not in STOPWORDS and len(w) > 2}
+
+
+# Capitalised words that carry no identity: days, months, countries used
+# generically, and sentence-initial words that only look like names.
+NOT_ENTITIES = {
+    "monday","tuesday","wednesday","thursday","friday","saturday","sunday",
+    "january","february","march","april","may","june","july","august",
+    "september","october","november","december",
+    "crypto","cryptocurrency","bitcoin","the","this","that","most","after",
+    "before","during","us","u.s","american","chief","executive","president",
+    "company","firm","lender","exchange","group","report","reports",
+}
+
+# Verb families. Two sentences naming the same organisation and doing the
+# same kind of thing are almost always one event seen through two outlets.
+ACTION_GROUPS = [
+    ("halt", "paus", "suspend", "freez", "stopp", "block", "withdraw"),
+    ("acquir", "merg", "buyout", "takeover", "deal", "purchas"),
+    ("fil", "appli", "submit", "list", "regist", "approv", "appear"),
+    ("cut", "slash", "reduc", "lower", "decreas", "trim"),
+    ("rais", "hike", "increas", "lift", "boost"),
+    ("sanction", "ban", "restrict", "prohibit", "embargo"),
+    ("sue", "lawsuit", "charg", "investigat", "probe", "accus", "alleg"),
+    ("resign", "quit", "step down", "fired", "depart", "exit"),
+    ("collaps", "bankrupt", "insolven", "fail", "default", "seiz", "clos"),
+    ("attack", "strike", "invad", "bomb"),
+]
+
+
+def _entities(text: str) -> set:
+    """Distinctive names in a sentence, ignoring days, months and generics."""
+    caps = re.findall(r"\b[A-Z][a-zA-Z&.]{2,}\b", text)
+    return {c.lower().strip(".") for c in caps
+            if c.lower().strip(".") not in NOT_ENTITIES}
+
+
+def _actions(text: str) -> set:
+    """Which verb families this sentence belongs to."""
+    low = text.lower()
+    return {i for i, group in enumerate(ACTION_GROUPS)
+            if any(v in low for v in group)}
+
+
+def _same_event(a: str, b: str,
+                jaccard_threshold: float = 0.45) -> bool:
     """
-    The same event gets reported by many outlets in different words. Merge
-    near-duplicates, keeping the first occurrence and recording how many
-    documents mentioned it.
+    Are these two sentences reporting the same event.
 
-    Uses token Jaccard, which is crude but works well enough for headline
-    events that share proper nouns and figures. A sentence embedding model
-    would do better if one is available.
+    Word overlap alone misses the common case. Three outlets writing
+    "Celsius announced it was suspending customer withdrawals", "Celsius
+    paused all withdrawals and transfers" and "Celsius halted withdrawals"
+    share few exact words but are plainly one event, and letting all three
+    through as separate correct answers makes a question trivial.
 
-    The mention count is useful later: an event reported by many outlets is
-    usually a more central part of the story.
+    So: merge if the wording overlaps heavily, OR if they name the same
+    organisation and describe the same kind of action.
     """
-    def toks(s):
-        return set(re.findall(r"\w+", s.lower()))
+    ta, tb = _content_tokens(a), _content_tokens(b)
+    if not ta or not tb:
+        return False
 
+    union = ta | tb
+    if union and len(ta & tb) / len(union) >= jaccard_threshold:
+        return True
+
+    ea, eb = _entities(a), _entities(b)
+    shared_entity = ea & eb
+    if not shared_entity:
+        return False
+
+    aa, ab = _actions(a), _actions(b)
+    # same actor doing the same kind of thing
+    return bool(aa & ab)
+
+
+def deduplicate_events(events: List[Dict], threshold: float = 0.45) -> List[Dict]:
+    """
+    Merge candidates that report the same event.
+
+    The same happening gets covered by many outlets in different words, and
+    each version reads as a separate valid cause. Left unmerged, one event
+    can occupy three of the four option slots.
+
+    Keeps the longest version, since it usually carries the most detail,
+    and records how many documents mentioned it.
+    """
     merged: List[Dict] = []
     for e in events:
-        te = toks(e["text"])
         hit = None
         for m in merged:
-            tm = toks(m["text"])
-            union = te | tm
-            if union and len(te & tm) / len(union) >= threshold:
+            if _same_event(e["text"], m["text"], jaccard_threshold=threshold):
                 hit = m
                 break
         if hit:
             hit["n_mentions"] += 1
-            hit["sources"].add(e["source"])
+            hit["sources"].add(e.get("source", ""))
+            # prefer the fuller phrasing
+            if len(e["text"]) > len(hit["text"]):
+                hit["text"] = e["text"]
         else:
             e = dict(e)
             e["n_mentions"] = 1
-            e["sources"] = {e["source"]}
+            e["sources"] = {e.get("source", "")}
             merged.append(e)
 
     for m in merged:
-        m["sources"] = sorted(x for x in m["sources"] if x)
+        m["sources"] = sorted(s for s in m["sources"] if s)
     return merged
 
 
